@@ -717,6 +717,28 @@ describe("reversible native Codex route integration", () => {
     }
   });
 
+  test("journal v10 setup accepts marker-free semantic hooks and remains idempotent", () => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    writeFileSync(configPath, 'model = "gpt-5.6-sol"\n');
+    const config = nativeConfig("full");
+    installCodexIntegration(config);
+    const current = readFileSync(configPath, "utf8").replace(/^#.*interrupt.*\n/gm, "")
+      .replace("timeout = 3", "timeout  =  3 # user note");
+    writeFileSync(configPath, current);
+    const journal = readFileSync(getCodexJournalPath(), "utf8");
+    expect(JSON.parse(journal).version).toBe(10);
+    preflightCodexIntegration(config, { replaceExistingRoute: true });
+    expect(readFileSync(configPath, "utf8")).toBe(current);
+    expect(readFileSync(getCodexJournalPath(), "utf8")).toBe(journal);
+    installCodexIntegration(config, { replaceExistingRoute: true });
+    const repaired = readFileSync(configPath, "utf8");
+    expect(repaired).toContain("# user note");
+    expect(inspectCodexIntegration().errors).toEqual([]);
+    installCodexIntegration(config, { replaceExistingRoute: true });
+    expect(readFileSync(configPath, "utf8")).toBe(repaired);
+  });
+
   test("explicit setup still refuses changed hooks, partial removal and invalid config", () => {
     const { codexHome } = fixture();
     const configPath = join(codexHome, "config.toml");
@@ -730,7 +752,6 @@ describe("reversible native Codex route integration", () => {
     const recovery = readFileSync(getCodexJournalRecoveryPath(), "utf8");
     for (const current of [
       active.replace("timeout = 3", "timeout = 2"),
-      active.replace(/^#.*interrupt.*\n/gm, ""),
       withoutHook + installed.interruptHook.fragment.split("[[hooks.Interrupt]]")[0],
       withoutHook + `\n[hooks.state.${JSON.stringify(installed.interruptHook.stateKey)}]\ntrusted_hash = ${JSON.stringify(installed.interruptHook.trustedHash)}\n`,
       withoutHook + '\n[[hooks.Interrupt]]\n[[hooks.Interrupt.hooks]]\ntype = "command"\ncommand = "user-modified-hook"\n',
