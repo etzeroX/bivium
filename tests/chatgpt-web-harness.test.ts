@@ -2091,6 +2091,12 @@ describe("ChatGPT outer-native harness v4", () => {
     const finalRevision = broker.beginCompletionFence(token);
     expect(finalRevision).toBe(4);
     expect(broker.commitCompletionFence(token, finalRevision!)).toBeTrue();
+    expect(await callTurnBroker<{ completed: boolean; retired: boolean }>(socketPath, {
+      method: "activity_complete",
+      token,
+      activityId: "activity_cleanup_after_commit_01",
+    })).toEqual({ completed: false, retired: true });
+    expect(broker.beginCompletionFence(token)).toBe(finalRevision);
     await expect(callTurnBroker(socketPath, { method: "claim", token }))
       .rejects.toThrow("has already finished");
     await broker.close();
