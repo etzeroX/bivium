@@ -303,6 +303,10 @@ export async function requestRetainedCompactionHandoff(
   if (operationSignal.aborted) abortBrowser();
   else operationSignal.addEventListener("abort", abortBrowser, { once: true });
   try {
+    // A final browserOutcome may be visible before the source helper completes /turn/end.
+    // Reusing its lease before that handshake races the still-active launcher owner. Apply the
+    // same physical-settlement barrier even when the caller found an already-completed source.
+    await withCompactionAbort(source.physicalSettlement, operationSignal);
     const transactionPromise = broker.beginCompactionTransaction(traceId, operationTimeoutMs);
     void transactionPromise.then(lateTransaction => {
       if (operationSignal.aborted && transaction !== lateTransaction) {
