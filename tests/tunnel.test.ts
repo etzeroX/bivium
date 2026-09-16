@@ -1,12 +1,50 @@
 import { describe, expect, test } from "bun:test";
-import { TUNNEL_VERSION, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
+import {
+  TUNNEL_VERSION,
+  parseTunnelStatus,
+  tunnelClientInstallAction,
+  tunnelClientRelease,
+  tunnelCommandOutput,
+  tunnelConnectLaunchError,
+} from "../src/tunnel";
 
 test("pins the fixed tunnel-client and migrates only the previously shipped version", () => {
-  expect(TUNNEL_VERSION).toBe("0.0.12");
-  expect(tunnelClientInstallAction("0.0.12")).toBe("reuse");
+  expect(TUNNEL_VERSION).toBe("0.0.14");
+  expect(tunnelClientInstallAction("0.0.14")).toBe("reuse");
+  expect(tunnelClientInstallAction("0.0.12")).toBe("upgrade");
   expect(tunnelClientInstallAction("0.0.10")).toBe("upgrade");
   expect(() => tunnelClientInstallAction("0.0.11")).toThrow("not a trusted upgrade source");
+  expect(() => tunnelClientInstallAction("0.0.13")).toThrow("not a trusted upgrade source");
   expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted upgrade source");
+});
+
+test("pins every official 0.0.14 desktop archive checksum", () => {
+  expect(tunnelClientRelease("darwin", "x64")).toEqual({
+    asset: "tunnel-client-v0.0.14-darwin-amd64.zip",
+    sha256: "75e10be774184fb42189e347b16eb6bc9fb0780135d8af714d34e30ce068dc53",
+  });
+  expect(tunnelClientRelease("darwin", "arm64")).toEqual({
+    asset: "tunnel-client-v0.0.14-darwin-arm64.zip",
+    sha256: "b540493c5bdbcdbb755700c8e2e16597e28b1569e425007e0f73111047bd6a64",
+  });
+  expect(tunnelClientRelease("linux", "x64")).toEqual({
+    asset: "tunnel-client-v0.0.14-linux-amd64.zip",
+    sha256: "15bd17e805cad39d412199115bb9e10a978dd35258a114cdf25dd2ae6681c7d3",
+  });
+  expect(tunnelClientRelease("linux", "arm64")).toEqual({
+    asset: "tunnel-client-v0.0.14-linux-arm64.zip",
+    sha256: "2de3fb879a18edb847e0313592c912f1983685488290a7fdba7ac403e6a4fb0a",
+  });
+  expect(tunnelClientRelease("win32", "x64")).toEqual({
+    asset: "tunnel-client-v0.0.14-windows-amd64.zip",
+    sha256: "784ab8da7b5a88f0109f1fd8aaf0a1c86067430b896dddf307ef7e3cc49fa1a5",
+  });
+  expect(tunnelClientRelease("win32", "arm64")).toEqual({
+    asset: "tunnel-client-v0.0.14-windows-arm64.zip",
+    sha256: "fa775db8897df543dd4ba66404f69492a2acfbc6a291f10df27aced064a16568",
+  });
+  expect(() => tunnelClientRelease("freebsd", "x64")).toThrow("no pinned build");
+  expect(() => tunnelClientRelease("linux", "ia32")).toThrow("no pinned build");
 });
 
 describe("tunnel status boundary", () => {
