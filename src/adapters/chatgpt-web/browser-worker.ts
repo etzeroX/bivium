@@ -1297,13 +1297,14 @@ export function chatGptSubmissionEvidence(state: {
 
 export type ChatGptConnectorAttachmentMode = "none" | "mention" | "retained";
 
-/** A launcher lease may reuse a connector only after proving that exact retained surface is bound. */
+/** Retaining history never proves the connector selection in the current composer. */
 export function chatGptConnectorAttachmentMode(
   localTools: boolean,
-  reuseConversation: boolean,
+  _reuseConversation: boolean,
 ): ChatGptConnectorAttachmentMode {
   if (!localTools) return "none";
-  return reuseConversation ? "retained" : "mention";
+  // selectConnector checks the live pill first, selecting it only when it is absent.
+  return "mention";
 }
 
 export async function setChatGptThinkMode(
