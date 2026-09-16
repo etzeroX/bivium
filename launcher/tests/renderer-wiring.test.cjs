@@ -287,7 +287,7 @@ test("MCP navigation remains locked while an operation is active", () => {
 test("failed doctor reports retain every failed check", () => {
   assert.match(
     appSource,
-    /report\.ok\s*\?\s*report\.checks\.slice\(-6\)\s*:\s*report\.checks\.filter\(\(check\) => check\.status !== "ok"\)/,
+    /report\.ok \? otherChecks\.slice\(-6\) : otherChecks\.filter\(\(check\) => check\.status !== "ok"\)/,
   );
   assert.match(appSource, /visibleChecks\.map\(\(check\) =>/);
 });
@@ -322,6 +322,36 @@ test("MCP verification proves runtime health before checking the connector", () 
   );
   assert.match(handler, /publishOperation\(\{ name: operationName, status: "completed"/);
   assert.match(appSource, /operation\?\.name === "mcp-verification"/);
+});
+
+test("launcher doctor distinguishes catalog verification from MCP connector discovery", () => {
+  assert.match(electronMain, /function enrichLauncherDoctorReport\(/);
+  assert.match(electronMain, /Waiting for restarted Codex to request the model catalog/);
+  assert.match(electronMain, /MCP connector discovery: VERIFIED/);
+  assert.match(electronMain, /MCP connector discovery: NOT VERIFIED/);
+  assert.match(electronMain, /handle\("launcher:doctor", async \(\) =>/);
+  assert.match(appSource, /DIAGNOSTIC_STATE_CHECK_IDS/);
+
+  const start = electronMain.indexOf("function enrichLauncherDoctorReport(");
+  const end = electronMain.indexOf("\nfunction ", start + 1);
+  const enrich = Function(`${electronMain.slice(start, end)}\nreturn enrichLauncherDoctorReport;`)();
+  const report = { ok: true, mode: "full", checks: [{ id: "runtime-mode", status: "ok", message: "Runtime: full" }] };
+  const pending = enrich(report, {
+    codexCatalogVerified: false,
+    mcpRuntimeInstalled: true,
+    mcpSetupComplete: false,
+  });
+  assert.deepEqual(pending.checks.slice(-3).map(check => [check.id, check.status, check.message]), [
+    ["mcp-runtime", "ok", "MCP runtime installation: INSTALLED"],
+    ["mcp-discovery", "warning", "MCP connector discovery: NOT VERIFIED"],
+    ["catalog-verification", "warning", "Waiting for restarted Codex to request the model catalog"],
+  ]);
+  const verified = enrich(report, {
+    codexCatalogVerified: true,
+    mcpRuntimeInstalled: true,
+    mcpSetupComplete: true,
+  });
+  assert.ok(verified.checks.slice(-3).every(check => check.status === "ok"));
 });
 
 test("saved ChatGPT authentication is refreshed before setup is presented", () => {

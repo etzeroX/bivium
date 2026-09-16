@@ -2140,10 +2140,27 @@ function FieldRow({ children, label }: { children: ReactNode; label: string }) {
   );
 }
 
+const DIAGNOSTIC_STATE_CHECK_IDS = new Set([
+  "runtime-mode",
+  "connector-identity",
+  "local-tools",
+  "tunnel-config",
+  "tunnel-process",
+  "tunnel-health",
+  "tunnel-readiness",
+  "control-plane-poll",
+  "mcp-runtime",
+  "mcp-discovery",
+  "catalog-verification",
+]);
+
 function DoctorSummary({ copy, language, report }: { copy: Copy; language: Language; report: DoctorReport }) {
-  const visibleChecks = report.ok
-    ? report.checks.slice(-6)
-    : report.checks.filter((check) => check.status !== "ok");
+  const stateChecks = report.checks.filter((check) => DIAGNOSTIC_STATE_CHECK_IDS.has(check.id));
+  const otherChecks = report.checks.filter((check) => !DIAGNOSTIC_STATE_CHECK_IDS.has(check.id));
+  const visibleChecks = [
+    ...stateChecks,
+    ...(report.ok ? otherChecks.slice(-6) : otherChecks.filter((check) => check.status !== "ok")),
+  ];
   return (
     <div className={`doctor-summary${report.ok ? " is-healthy" : ""}`}>
       <header>
