@@ -2521,7 +2521,10 @@ export class ChatGptBrowserWorker {
       );
       if (count === 1) return composers.first();
       await withBrowserTurnAbort(
-        new Promise(resolveSleep => setTimeout(resolveSleep, 50)),
+        this.waitForTurnDomMutation(
+          page,
+          Math.min(CHATGPT_UI_SETTLE_MS, Math.max(1, deadline - Date.now())),
+        ),
         abortSignal,
       );
     }
