@@ -1030,9 +1030,10 @@ test("closing the launcher page is an immediate terminal turn error", async () =
   expect((error as Error).message).toContain("turn was cancelled");
 });
 
-test("active composer resolution waits for exactly one visible editor", async () => {
+test("active composer resolution follows delayed DOM hydration without fixed sleeps", async () => {
   const composer = { id: "active" };
-  const counts = [2, 1];
+  const counts = [0, 2, 1];
+  let mutationWaits = 0;
   const visibleComposers = {
     count: async () => counts.shift() ?? 1,
     first: () => composer,
@@ -1049,7 +1050,14 @@ test("active composer resolution waits for exactly one visible editor", async ()
     activeComposer(page: unknown, timeoutMs?: number): Promise<unknown>;
   }).activeComposer;
 
-  expect(await activeComposer.call({}, page, 500)).toBe(composer);
+  expect(await activeComposer.call({
+    waitForTurnDomMutation: async (observedPage: unknown, timeoutMs: number) => {
+      expect(observedPage).toBe(page);
+      expect(timeoutMs).toBeGreaterThan(0);
+      mutationWaits += 1;
+    },
+  }, page, 500)).toBe(composer);
+  expect(mutationWaits).toBe(2);
 });
 
 test("prompt verification accepts Lexical NBSP preservation without weakening other mismatches", async () => {
