@@ -7,6 +7,7 @@ import {
   currentRuntimeCommand,
   defaultBrokerEndpoint,
   defaultConfig,
+  getConfigDir,
   getConfigPath,
   loadConfigForSetup,
   resolveInteractionConnectorIdentities,
@@ -20,6 +21,11 @@ import {
   storedBrowserLoginCapabilities,
 } from "./browser-login";
 import {
+  getCodexConfigPath,
+  getCodexJournalPath,
+  getCodexJournalRecoveryPath,
+  getCodexModelsCachePath,
+  inspectCodexIntegration,
   installCodexIntegration,
   preflightCodexIntegration,
   readCodexSubagentProtocol,
@@ -41,6 +47,7 @@ import {
 import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
+import { SetupTransaction } from "./setup-transaction";
 
 export interface SetupOptions {
   mode: RuntimeMode;
@@ -478,11 +485,8 @@ export function preflightSetup(options: SetupOptions): void {
   });
 }
 
-export async function setup(options: SetupOptions): Promise<SetupResult> {
+async function performSetup(options: SetupOptions): Promise<SetupResult> {
   const { existing, config, launcherOwned } = prepareSetup(options);
-  preflightCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
   if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
   const beforeService = getServiceStatus();
@@ -617,12 +621,6 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     await uninstallService(existing!);
   }
   if (launcherOwned) saveConfig(config);
-  // Keep the previous terminal runtime intact through the ownership handoff. A later launcher
-  // setup removes it once the launcher-owned configuration is already the established baseline.
-  const migratingTerminalRuntime = Boolean(
-    launcherOwned && existing && existing.browserHost !== "launcher",
-  );
-  if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
   installCodexIntegration(config, {
     replaceExistingRoute: options.replaceCodexRoute,
   });
@@ -636,6 +634,67 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     codexRestartRequired: true,
     connectorSetupRequired: config.mode === "full",
   };
+}
+
+function setupManagedFilePaths(): Array<{ path: string; followSymlink?: boolean }> {
+  const home = getConfigDir();
+  return [
+    { path: getConfigPath() },
+    { path: getCodexConfigPath(), followSymlink: true },
+    { path: getCodexModelsCachePath() },
+    { path: getCodexJournalPath() },
+    { path: getCodexJournalRecoveryPath() },
+    { path: managedRuntimeKeyPath("automatic") },
+    { path: managedRuntimeKeyPath("manual") },
+    { path: join(home, "bin", process.platform === "win32" ? "tunnel-client.exe" : "tunnel-client") },
+    { path: join(home, "bin", "tunnel-client-manifest.json") },
+    { path: join(home, "tunnel", "profiles", "codex-chatgpt-web.yaml") },
+    { path: join(home, "tunnel", "profiles", "codex-chatgpt-web-zero-risk.yaml") },
+  ];
+}
+
+export async function setup(options: SetupOptions): Promise<SetupResult> {
+  const transaction = new SetupTransaction();
+  try {
+    for (const managed of setupManagedFilePaths()) {
+      transaction.track(managed.path, { followSymlink: managed.followSymlink });
+    }
+    const previousConfig = loadExistingConfig();
+    preflightSetup(options);
+    transaction.prepared();
+    const result = await performSetup(options);
+    transaction.applied();
+
+    const integration = inspectCodexIntegration();
+    if (!integration.installed || !integration.active || integration.errors.length > 0) {
+      throw new Error(
+        integration.errors.length > 0
+          ? `Setup verification failed: ${integration.errors.join("; ")}`
+          : "Setup verification failed: Codex integration is not active",
+      );
+    }
+    const committedConfig = loadConfigForSetup();
+    if (committedConfig.mode !== result.mode) {
+      throw new Error(`Setup verification failed: expected ${result.mode} mode, found ${committedConfig.mode}`);
+    }
+    transaction.verified();
+    transaction.commit();
+    // Legacy directory removal is irreversible and must not precede final verification. Keep the
+    // old terminal runtime through ownership migration; cleanup failure cannot undo a committed
+    // installation or masquerade as a transaction rollback.
+    const migratingTerminalRuntime = committedConfig.browserHost === "launcher"
+      && previousConfig && previousConfig.browserHost !== "launcher";
+    if (!migratingTerminalRuntime) {
+      try {
+        removeLegacyRuntimeArtifacts(committedConfig);
+      } catch {
+        console.warn("Setup committed; obsolete runtime artifacts could not be removed");
+      }
+    }
+    return result;
+  } catch (error) {
+    return transaction.rollback(error);
+  }
 }
 
 /**

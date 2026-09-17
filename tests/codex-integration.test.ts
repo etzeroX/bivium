@@ -717,6 +717,28 @@ describe("reversible native Codex route integration", () => {
     }
   });
 
+  test("journal v10 setup accepts marker-free semantic hooks and remains idempotent", () => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    writeFileSync(configPath, 'model = "gpt-5.6-sol"\n');
+    const config = nativeConfig("full");
+    installCodexIntegration(config);
+    const current = readFileSync(configPath, "utf8").replace(/^#.*interrupt.*\n/gm, "")
+      .replace("timeout = 3", "timeout  =  3 # user note");
+    writeFileSync(configPath, current);
+    const journal = readFileSync(getCodexJournalPath(), "utf8");
+    expect(JSON.parse(journal).version).toBe(10);
+    preflightCodexIntegration(config, { replaceExistingRoute: true });
+    expect(readFileSync(configPath, "utf8")).toBe(current);
+    expect(readFileSync(getCodexJournalPath(), "utf8")).toBe(journal);
+    installCodexIntegration(config, { replaceExistingRoute: true });
+    const repaired = readFileSync(configPath, "utf8");
+    expect(repaired).toContain("# user note");
+    expect(inspectCodexIntegration().errors).toEqual([]);
+    installCodexIntegration(config, { replaceExistingRoute: true });
+    expect(readFileSync(configPath, "utf8")).toBe(repaired);
+  });
+
   test("explicit setup still refuses changed hooks, partial removal and invalid config", () => {
     const { codexHome } = fixture();
     const configPath = join(codexHome, "config.toml");
@@ -730,7 +752,6 @@ describe("reversible native Codex route integration", () => {
     const recovery = readFileSync(getCodexJournalRecoveryPath(), "utf8");
     for (const current of [
       active.replace("timeout = 3", "timeout = 2"),
-      active.replace(/^#.*interrupt.*\n/gm, ""),
       withoutHook + installed.interruptHook.fragment.split("[[hooks.Interrupt]]")[0],
       withoutHook + `\n[hooks.state.${JSON.stringify(installed.interruptHook.stateKey)}]\ntrusted_hash = ${JSON.stringify(installed.interruptHook.trustedHash)}\n`,
       withoutHook + '\n[[hooks.Interrupt]]\n[[hooks.Interrupt.hooks]]\ntype = "command"\ncommand = "user-modified-hook"\n',
@@ -801,6 +822,80 @@ describe("reversible native Codex route integration", () => {
     expect(readFileSync(configPath, "utf8")).toContain('openai_base_url = "http://127.0.0.1:17842/v1"');
     uninstallCodexIntegration();
     expect(readFileSync(configPath, "utf8")).toBe('model = "gpt-5.6-sol"\n');
+  });
+
+  test.each(["browser-only", "full"] as const)(
+    "an exact %s reinstall is byte-for-byte idempotent",
+    mode => {
+      const { codexHome } = fixture();
+      const configPath = join(codexHome, "config.toml");
+      writeFileSync(configPath, 'model = "gpt-5.6-sol"\napproval_policy = "on-request"\n');
+      const config = nativeConfig(mode);
+
+      installCodexIntegration(config);
+      const firstConfig = readFileSync(configPath, "utf8");
+      const firstJournal = readFileSync(getCodexJournalPath(), "utf8");
+      const firstRecovery = readFileSync(getCodexJournalRecoveryPath(), "utf8");
+      installCodexIntegration(config);
+
+      expect(readFileSync(configPath, "utf8")).toBe(firstConfig);
+      expect(readFileSync(getCodexJournalPath(), "utf8")).toBe(firstJournal);
+      expect(readFileSync(getCodexJournalRecoveryPath(), "utf8")).toBe(firstRecovery);
+      expect(inspectCodexIntegration()).toMatchObject({ installed: true, active: true, errors: [] });
+      uninstallCodexIntegration();
+      expect(readFileSync(configPath, "utf8")).toBe(
+        'model = "gpt-5.6-sol"\napproval_policy = "on-request"\n',
+      );
+    },
+  );
+
+  test.each([
+    { label: "unsupported version", mutate: (journal: Record<string, unknown>) => { journal.version = 999; } },
+    { label: "invalid state", mutate: (journal: Record<string, unknown>) => { journal.active = "half-applied"; } },
+  ])("rejects an $label journal without changing config or recovery evidence", ({ mutate }) => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    writeFileSync(configPath, 'model = "gpt-5.6-sol"\n');
+    installCodexIntegration(nativeConfig("full"));
+    const installedConfig = readFileSync(configPath, "utf8");
+    const journal = JSON.parse(readFileSync(getCodexJournalPath(), "utf8")) as Record<string, unknown>;
+    mutate(journal);
+    const corrupted = `${JSON.stringify(journal, null, 2)}\n`;
+    writeFileSync(getCodexJournalPath(), corrupted);
+    writeFileSync(getCodexJournalRecoveryPath(), corrupted);
+
+    expect(() => inspectCodexIntegration()).toThrow("Invalid Codex integration journal");
+    expect(readFileSync(configPath, "utf8")).toBe(installedConfig);
+    expect(readFileSync(getCodexJournalPath(), "utf8")).toBe(corrupted);
+    expect(readFileSync(getCodexJournalRecoveryPath(), "utf8")).toBe(corrupted);
+  });
+
+  test("accepts a semantic route rewrite but fails closed on a genuine external replacement", () => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    const original = 'model = "gpt-5.6-sol"\nopenai_base_url = "https://native.example/v1" # prior owner\n';
+    writeFileSync(configPath, original);
+
+    installCodexIntegration(nativeConfig("browser-only"), { replaceExistingRoute: true });
+    const semanticallyRewritten = readFileSync(configPath, "utf8").replace(
+      'openai_base_url = "http://127.0.0.1:17841/v1"',
+      "openai_base_url='http://127.0.0.1:17841/v1' # formatter",
+    );
+    writeFileSync(configPath, semanticallyRewritten);
+    expect(deactivateCodexIntegration()).toEqual({ changed: true, active: false });
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+
+    activateCodexIntegration();
+    const externallyReplaced = readFileSync(configPath, "utf8").replace(
+      'openai_base_url = "http://127.0.0.1:17841/v1"',
+      'openai_base_url = "https://external.example/v1"',
+    );
+    writeFileSync(configPath, externallyReplaced);
+    expect(() => uninstallCodexIntegration()).toThrow(
+      "openai_base_url changed after setup; refusing to overwrite the user's newer value",
+    );
+    expect(readFileSync(configPath, "utf8")).toBe(externallyReplaced);
+    expect(existsSync(getCodexJournalPath())).toBe(true);
   });
 
   test("upgrades the released v9 route by adding the trusted Interrupt lifecycle hook", () => {

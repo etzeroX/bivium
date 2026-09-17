@@ -1,17 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { unzipSync } from "fflate";
 import type { AppConfig, BrowserInteractionMode, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 
-export const TUNNEL_VERSION = "0.0.12";
-const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10"]);
+export const TUNNEL_VERSION = "0.0.14";
+const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10", "0.0.12"]);
 const RELEASE_BASE = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}`;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const TUNNEL_READY_TIMEOUT_MS = 120_000;
 const TUNNEL_STATUS_POLL_INTERVAL_MS = 1_000;
+const TUNNEL_ARCHIVE_SHA256: Readonly<Record<string, string>> = Object.freeze({
+  "darwin-amd64": "75e10be774184fb42189e347b16eb6bc9fb0780135d8af714d34e30ce068dc53",
+  "darwin-arm64": "b540493c5bdbcdbb755700c8e2e16597e28b1569e425007e0f73111047bd6a64",
+  "linux-amd64": "15bd17e805cad39d412199115bb9e10a978dd35258a114cdf25dd2ae6681c7d3",
+  "linux-arm64": "2de3fb879a18edb847e0313592c912f1983685488290a7fdba7ac403e6a4fb0a",
+  "windows-amd64": "784ab8da7b5a88f0109f1fd8aaf0a1c86067430b896dddf307ef7e3cc49fa1a5",
+  "windows-arm64": "fa775db8897df543dd4ba66404f69492a2acfbc6a291f10df27aced064a16568",
+});
 
 interface TunnelInstallManifest {
   version: 1;
@@ -31,14 +39,19 @@ function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function platformAsset(): string {
-  const os = process.platform === "darwin" ? "darwin"
-    : process.platform === "linux" ? "linux"
-      : process.platform === "win32" ? "windows"
+export function tunnelClientRelease(platform: string, architecture: string): {
+  asset: string;
+  sha256: string;
+} {
+  const os = platform === "darwin" ? "darwin"
+    : platform === "linux" ? "linux"
+      : platform === "win32" ? "windows"
         : undefined;
-  const arch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "amd64" : undefined;
-  if (!os || !arch) throw new Error(`openai/tunnel-client has no pinned build for ${process.platform}/${process.arch}`);
-  return `tunnel-client-v${TUNNEL_VERSION}-${os}-${arch}.zip`;
+  const arch = architecture === "arm64" ? "arm64" : architecture === "x64" ? "amd64" : undefined;
+  const key = os && arch ? `${os}-${arch}` : undefined;
+  const sha256 = key ? TUNNEL_ARCHIVE_SHA256[key] : undefined;
+  if (!key || !sha256) throw new Error(`openai/tunnel-client has no pinned build for ${platform}/${architecture}`);
+  return { asset: `tunnel-client-v${TUNNEL_VERSION}-${key}.zip`, sha256 };
 }
 
 async function fetchBytes(url: string, timeoutMs = 120_000): Promise<Uint8Array> {
@@ -105,12 +118,13 @@ export async function installTunnelClient(): Promise<string> {
     rmSync(manifestFile, { force: true });
   }
 
-  const asset = platformAsset();
+  const { asset, sha256: expected } = tunnelClientRelease(process.platform, process.arch);
   const [archive, sums] = await Promise.all([
     fetchBytes(`${RELEASE_BASE}/${asset}`),
     fetchBytes(`${RELEASE_BASE}/SHA256SUMS.txt`),
   ]);
-  const expected = parseExpectedChecksum(new TextDecoder().decode(sums), asset);
+  const published = parseExpectedChecksum(new TextDecoder().decode(sums), asset);
+  if (published !== expected) throw new Error(`Published checksum does not match the pinned checksum for ${asset}`);
   const archiveHash = sha256(archive);
   if (archiveHash !== expected) throw new Error(`Checksum mismatch for ${asset}`);
   const files = unzipSync(archive);
@@ -260,7 +274,7 @@ export function connectTunnel(config: AppConfig): void {
   if (result.status !== 0) {
     const detail = launchError && launchError !== "tunnel-client returned non-JSON connect output"
       ? launchError
-      : safeTunnelDetail(tunnelCommandOutput(result) || `exit ${result.status}`);
+      : `tunnel-client exited with status ${result.status} (diagnostic output withheld)`;
     throw new Error(`Tunnel managed startup failed: ${detail}`);
   }
   if (launchError) throw new Error(`Tunnel runtime exited during launch: ${launchError}`);
@@ -288,6 +302,93 @@ export interface TunnelRuntimeStatus {
   ready: boolean;
   state?: string;
   detail: string;
+}
+
+export type ControlPlanePollStatus =
+  | { state: "healthy"; timestamp: number }
+  | { state: "never-succeeded" }
+  | { state: "error"; detail: string }
+  | { state: "unsupported"; version: string };
+
+interface TunnelHealthReport {
+  control_plane_poll?: {
+    ok?: unknown;
+    value?: unknown;
+    error?: unknown;
+  };
+}
+
+export function parseControlPlanePollHealthReport(
+  output: string,
+  exitStatus = 0,
+): ControlPlanePollStatus {
+  let report: TunnelHealthReport;
+  try {
+    report = JSON.parse(output) as TunnelHealthReport;
+  } catch {
+    return { state: "error", detail: "tunnel-client returned an invalid control-plane health report" };
+  }
+  const poll = report && typeof report === "object" ? report.control_plane_poll : undefined;
+  if (!poll || typeof poll !== "object") {
+    return { state: "error", detail: "tunnel-client health report omitted the control-plane poll metric" };
+  }
+  if (poll.ok === true && typeof poll.value === "number" && Number.isFinite(poll.value) && poll.value > 0) {
+    return { state: "healthy", timestamp: poll.value };
+  }
+  if (poll.ok === false && (poll.value === undefined || poll.value === 0)
+    && poll.error === "no successful control-plane poll observed") {
+    return { state: "never-succeeded" };
+  }
+  const detail = typeof poll.error === "string" && /^(?:metrics endpoint returned HTTP )?[1-5][0-9]{2}(?: [A-Za-z ]+)?$/.test(poll.error)
+    ? `metrics endpoint returned HTTP ${poll.error.match(/[1-5][0-9]{2}/)![0]}`
+    : exitStatus !== 0
+      ? `tunnel-client health exited with status ${exitStatus}`
+      : "control-plane poll metric was invalid (diagnostic output withheld)";
+  return { state: "error", detail };
+}
+
+export function inspectControlPlanePoll(
+  config: AppConfig,
+  clientVersion = TUNNEL_VERSION,
+  execute: typeof runCommand = runCommand,
+): ControlPlanePollStatus {
+  const settings = tunnel(config);
+  if (clientVersion !== "0.0.14") return { state: "unsupported", version: clientVersion };
+  try {
+    const inventory = execute(
+      settings.binaryPath,
+      ["runtimes", "list", "--json"],
+      { timeout: 5_000 },
+    );
+    if (inventory.status !== 0) {
+      return { state: "error", detail: `local tunnel inventory failed with status ${inventory.status} (diagnostic output withheld)` };
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(inventory.stdout) as Record<string, unknown>;
+    } catch {
+      return { state: "error", detail: "local tunnel inventory returned invalid JSON" };
+    }
+    const aliases = parsed && typeof parsed === "object" && Array.isArray(parsed.aliases)
+      ? parsed.aliases.filter(entry => entry && typeof entry === "object"
+        && (entry as Record<string, unknown>).alias === settings.alias)
+      : [];
+    if (aliases.length !== 1) {
+      return { state: "error", detail: "local tunnel inventory has no unique configured alias" };
+    }
+    const healthURLFile = (aliases[0] as Record<string, unknown>).health_url_file;
+    if (typeof healthURLFile !== "string" || !isAbsolute(healthURLFile)) {
+      return { state: "error", detail: "local tunnel inventory has no absolute health URL file" };
+    }
+    const health = execute(
+      settings.binaryPath,
+      ["health", "--url-file", healthURLFile, "--require-control-plane-poll", "--json"],
+      { timeout: 5_000 },
+    );
+    return parseControlPlanePollHealthReport(health.stdout, health.status);
+  } catch {
+    return { state: "error", detail: "tunnel-client health command failed (diagnostic output withheld)" };
+  }
 }
 
 export function tunnelCommandOutput(result: {
@@ -332,6 +433,7 @@ export function tunnelConnectLaunchError(output: string): string | undefined {
   } catch {
     return "tunnel-client returned non-JSON connect output";
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "tunnel-client returned invalid connect output";
   const running = parsed.running === true;
   const healthy = parsed.healthy === true;
   const ready = parsed.ready === true;
@@ -349,15 +451,15 @@ export function tunnelConnectLaunchError(output: string): string | undefined {
     `healthy=${healthy}`,
     `ready=${ready}`,
     ...(exitCode !== undefined ? [`exit_code=${exitCode}`] : []),
-    ...(remoteError ? [`remote_error=${remoteError}`] : []),
-    ...(logTail ? [`runtime_log=${logTail}`] : []),
+    ...(remoteError ? ["remote_error=[withheld]"] : []),
+    ...(logTail ? ["runtime_log=[withheld]"] : []),
     ...(!remoteError && !logTail ? ["runtime did not complete a healthy launch"] : []),
   ].join("; "));
 }
 
 export function parseTunnelStatus(output: string, alias: string, exitStatus = 0): TunnelRuntimeStatus {
   if (exitStatus !== 0) {
-    return { ok: false, processRunning: false, healthy: false, ready: false, detail: safeTunnelDetail(output) };
+    return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client inventory exited with status ${exitStatus} (diagnostic output withheld)` };
   }
   try {
     const parsed = JSON.parse(output) as Record<string, unknown>;
@@ -368,7 +470,7 @@ export function parseTunnelStatus(output: string, alias: string, exitStatus = 0)
     if (!["stopped", "starting", "healthy", "ready"].includes(state)) {
       throw new Error("local inventory has an unsupported runtime state");
     }
-    // tunnel-client 0.0.12 derives these states from the live process and local healthz/readyz
+    // tunnel-client 0.0.14 derives these states from the live process and local healthz/readyz
     // probes. It does not need the optional remote control-plane lookup made by `status`.
     const processRunning = state !== "stopped";
     const healthy = state === "healthy" || state === "ready";
@@ -385,7 +487,7 @@ export function parseTunnelStatus(output: string, alias: string, exitStatus = 0)
       ].join("; "));
     return { ok, processRunning, healthy, ready, state, detail };
   } catch (error) {
-    return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client returned invalid local inventory: ${safeTunnelDetail(error instanceof Error ? error.message : String(error))}` };
+    return { ok: false, processRunning: false, healthy: false, ready: false, detail: "tunnel-client returned invalid local inventory" };
   }
 }
 

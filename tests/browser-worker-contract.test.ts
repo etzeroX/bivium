@@ -232,9 +232,9 @@ test("response caching rechecks CSS visibility without requiring a DOM mutation"
   }
 });
 
-test("a retained MCP conversation reuses its proven connector binding", () => {
+test("a retained MCP conversation must verify its current connector binding", () => {
   expect(chatGptConnectorAttachmentMode(true, false)).toBe("mention");
-  expect(chatGptConnectorAttachmentMode(true, true)).toBe("retained");
+  expect(chatGptConnectorAttachmentMode(true, true)).toBe("mention");
   expect(chatGptConnectorAttachmentMode(false, false)).toBe("none");
 });
 
@@ -1030,9 +1030,10 @@ test("closing the launcher page is an immediate terminal turn error", async () =
   expect((error as Error).message).toContain("turn was cancelled");
 });
 
-test("active composer resolution waits for exactly one visible editor", async () => {
+test("active composer resolution follows delayed DOM hydration without fixed sleeps", async () => {
   const composer = { id: "active" };
-  const counts = [2, 1];
+  const counts = [0, 2, 1];
+  let mutationWaits = 0;
   const visibleComposers = {
     count: async () => counts.shift() ?? 1,
     first: () => composer,
@@ -1049,7 +1050,14 @@ test("active composer resolution waits for exactly one visible editor", async ()
     activeComposer(page: unknown, timeoutMs?: number): Promise<unknown>;
   }).activeComposer;
 
-  expect(await activeComposer.call({}, page, 500)).toBe(composer);
+  expect(await activeComposer.call({
+    waitForTurnDomMutation: async (observedPage: unknown, timeoutMs: number) => {
+      expect(observedPage).toBe(page);
+      expect(timeoutMs).toBeGreaterThan(0);
+      mutationWaits += 1;
+    },
+  }, page, 500)).toBe(composer);
+  expect(mutationWaits).toBe(2);
 });
 
 test("prompt verification accepts Lexical NBSP preservation without weakening other mismatches", async () => {
@@ -2168,7 +2176,7 @@ test("an abort while inserting a connector prompt clears the selected pill and p
   expect(connectorSelected).toBeFalse();
 });
 
-test("retained tool turns insert into the connector-bound composer without selecting it again", async () => {
+test("retained tool turns verify their connector before inserting the prompt", async () => {
   const attachPrompt = (ChatGptBrowserWorker.prototype as unknown as {
     attachPrompt(
       page: unknown,
@@ -2186,14 +2194,15 @@ test("retained tool turns insert into the connector-bound composer without selec
   const composer = {
     fill: async (value: string) => { expect(value).toBe(""); calls.push("fill"); },
     focus: async () => { calls.push("focus"); },
+    press: async () => { calls.push("end"); },
   };
   await attachPrompt.call({
     activeComposer: async () => composer,
-    selectConnector: async () => { throw new Error("retained connector must not be selected again"); },
-    insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe("retained context"); calls.push("insert"); },
+    selectConnector: async () => { calls.push("verify-connector"); return composer; },
+    insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe(" retained context"); calls.push("insert"); },
     assertPromptAttached: async () => { calls.push("assert"); },
   }, {}, "retained context", true, undefined, undefined, false, undefined, true);
-  expect(calls).toEqual(["fill", "focus", "insert", "assert"]);
+  expect(calls).toEqual(["verify-connector", "focus", "end", "insert", "assert"]);
 });
 
 test("image attachment readiness uses exact file tiles and not localized remove-button text", async () => {
@@ -2389,14 +2398,14 @@ test("Think attachment runs after fresh connector selection and rechecks retaine
     };
     await attach.call(worker, ui.page, "requested task", localTools, undefined, undefined, false, undefined, retained, true);
     expect(submitted).toEqual([true]);
-    expect(connectorSelections).toBe(localTools && !retained ? 1 : 0);
-    if (localTools && !retained) expect(ui.state.connectors).toEqual(["Codex Native2"]);
+    expect(connectorSelections).toBe(localTools ? 1 : 0);
+    if (localTools) expect(ui.state.connectors).toEqual(["Codex Native2"]);
     if (retained) {
       ui.state.pressed = false;
       await attach.call(worker, ui.page, "follow-up task", localTools, undefined, undefined, false, undefined, retained, true);
       expect(submitted).toEqual([true, true]);
       expect(ui.state.commands).toEqual(["/think", "/think"]);
-      expect(connectorSelections).toBe(0);
+      expect(connectorSelections).toBe(2);
     }
   }
 });
@@ -2658,6 +2667,49 @@ test.each([
   const fixture = dialogPage(alertText);
 
   await expect(throwIfChatGptSessionFailureAlert(fixture.page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 401,
+    errorType: "authentication_error",
+    code: "chatgpt_session_expired",
+    retryable: false,
+  });
+});
+
+test.each([
+  "The message you submitted was too long. Please reload the conversation and submit something shorter.",
+  "El mensaje que enviaste era demasiado largo. Vuelve a cargar la conversación y envía algo más corto.",
+  "您提交的消息太长，请重新加载对话并提交较短的内容。",
+  "送信したメッセージが長すぎます。会話を再読み込みして、短いメッセージを送信してください。",
+])("an explicit product message limit is not reported as a generic handoff timeout: %s", async alertText => {
+  const fixture = dialogPage(alertText);
+  await expect(throwIfChatGptSessionFailureAlert(fixture.page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 413,
+    errorType: "invalid_request_error",
+    code: "chatgpt_message_too_long",
+    retryable: false,
+  });
+});
+
+test("an expired session remains authoritative when a message-too-long alert also exists", async () => {
+  const texts = [
+    "The message you submitted was too long. Please submit something shorter.",
+    "Your session has expired. Please log in again to continue using the app.",
+  ];
+  const page = {
+    locator: () => ({
+      filter: ({ hasText }: { hasText: string | RegExp }) => {
+        const visible = texts.some(text => typeof hasText === "string" ? text.includes(hasText) : hasText.test(text));
+        const filtered = {
+          last: () => filtered,
+          isVisible: async () => visible,
+        };
+        return filtered;
+      },
+    }),
+  } as unknown as Page;
+
+  await expect(throwIfChatGptSessionFailureAlert(page)).rejects.toMatchObject({
     name: "ChatGptWebAdapterError",
     status: 401,
     errorType: "authentication_error",
