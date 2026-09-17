@@ -803,6 +803,52 @@ describe("reversible native Codex route integration", () => {
     expect(readFileSync(configPath, "utf8")).toBe('model = "gpt-5.6-sol"\n');
   });
 
+  test.each(["browser-only", "full"] as const)(
+    "an exact %s reinstall is byte-for-byte idempotent",
+    mode => {
+      const { codexHome } = fixture();
+      const configPath = join(codexHome, "config.toml");
+      writeFileSync(configPath, 'model = "gpt-5.6-sol"\napproval_policy = "on-request"\n');
+      const config = nativeConfig(mode);
+
+      installCodexIntegration(config);
+      const firstConfig = readFileSync(configPath, "utf8");
+      const firstJournal = readFileSync(getCodexJournalPath(), "utf8");
+      const firstRecovery = readFileSync(getCodexJournalRecoveryPath(), "utf8");
+      installCodexIntegration(config);
+
+      expect(readFileSync(configPath, "utf8")).toBe(firstConfig);
+      expect(readFileSync(getCodexJournalPath(), "utf8")).toBe(firstJournal);
+      expect(readFileSync(getCodexJournalRecoveryPath(), "utf8")).toBe(firstRecovery);
+      expect(inspectCodexIntegration()).toMatchObject({ installed: true, active: true, errors: [] });
+      uninstallCodexIntegration();
+      expect(readFileSync(configPath, "utf8")).toBe(
+        'model = "gpt-5.6-sol"\napproval_policy = "on-request"\n',
+      );
+    },
+  );
+
+  test.each([
+    { label: "unsupported version", mutate: (journal: Record<string, unknown>) => { journal.version = 999; } },
+    { label: "invalid state", mutate: (journal: Record<string, unknown>) => { journal.active = "half-applied"; } },
+  ])("rejects an $label journal without changing config or recovery evidence", ({ mutate }) => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    writeFileSync(configPath, 'model = "gpt-5.6-sol"\n');
+    installCodexIntegration(nativeConfig("full"));
+    const installedConfig = readFileSync(configPath, "utf8");
+    const journal = JSON.parse(readFileSync(getCodexJournalPath(), "utf8")) as Record<string, unknown>;
+    mutate(journal);
+    const corrupted = `${JSON.stringify(journal, null, 2)}\n`;
+    writeFileSync(getCodexJournalPath(), corrupted);
+    writeFileSync(getCodexJournalRecoveryPath(), corrupted);
+
+    expect(() => inspectCodexIntegration()).toThrow("Invalid Codex integration journal");
+    expect(readFileSync(configPath, "utf8")).toBe(installedConfig);
+    expect(readFileSync(getCodexJournalPath(), "utf8")).toBe(corrupted);
+    expect(readFileSync(getCodexJournalRecoveryPath(), "utf8")).toBe(corrupted);
+  });
+
   test("upgrades the released v9 route by adding the trusted Interrupt lifecycle hook", () => {
     const { codexHome } = fixture();
     const configPath = join(codexHome, "config.toml");
