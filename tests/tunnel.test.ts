@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { TUNNEL_VERSION, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
+import { TUNNEL_VERSION, parseControlPlanePollHealthReport, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
 
 test("pins the fixed tunnel-client and migrates only the previously shipped version", () => {
   expect(TUNNEL_VERSION).toBe("0.0.12");
@@ -7,6 +7,31 @@ test("pins the fixed tunnel-client and migrates only the previously shipped vers
   expect(tunnelClientInstallAction("0.0.10")).toBe("upgrade");
   expect(() => tunnelClientInstallAction("0.0.11")).toThrow("not a trusted upgrade source");
   expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted upgrade source");
+});
+
+describe("control-plane poll health", () => {
+  test("parses the official 0.0.14 health report", () => {
+    expect(parseControlPlanePollHealthReport(JSON.stringify({
+      control_plane_poll: { ok: true, value: 1_700_000_000 },
+    }))).toEqual({ state: "healthy", timestamp: 1_700_000_000 });
+    expect(parseControlPlanePollHealthReport(JSON.stringify({
+      control_plane_poll: {
+        ok: false,
+        error: "no successful control-plane poll observed",
+      },
+    }), 2)).toEqual({ state: "never-succeeded" });
+  });
+
+  test("rejects missing, invalid, and failed health reports", () => {
+    expect(parseControlPlanePollHealthReport("not json", 2)).toEqual({
+      state: "error",
+      detail: "tunnel-client returned an invalid control-plane health report",
+    });
+    expect(parseControlPlanePollHealthReport(JSON.stringify({}), 2).state).toBe("error");
+    expect(parseControlPlanePollHealthReport(JSON.stringify({
+      control_plane_poll: { ok: false, error: "metrics endpoint returned HTTP 500" },
+    }), 2)).toEqual({ state: "error", detail: "metrics endpoint returned HTTP 500" });
+  });
 });
 
 describe("tunnel status boundary", () => {

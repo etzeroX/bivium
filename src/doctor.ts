@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getServiceStatus } from "./service";
-import { tunnelStatus, type TunnelRuntimeStatus } from "./tunnel";
+import {
+  inspectControlPlanePoll,
+  tunnelStatus,
+  type ControlPlanePollStatus,
+  type TunnelRuntimeStatus,
+} from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
 import {
   inspectLauncherBrowserHost,
@@ -32,6 +37,7 @@ export interface DoctorReport {
 export function runtimeStateChecks(
   config: Pick<AppConfig, "mode" | "appName">,
   runtime?: TunnelRuntimeStatus,
+  controlPlanePoll?: ControlPlanePollStatus,
 ): DoctorCheck[] {
   const full = config.mode === "full";
   const checks: DoctorCheck[] = [
@@ -64,12 +70,35 @@ export function runtimeStateChecks(
       message: `Tunnel local readiness: ${runtime.ready ? "READY" : "NOT READY"}`,
       ...(!runtime.ready ? { detail: runtime.detail } : {}),
     },
-    {
+  );
+  if (!controlPlanePoll || controlPlanePoll.state === "unsupported") {
+    const version = controlPlanePoll?.state === "unsupported" ? controlPlanePoll.version : "unknown";
+    checks.push({
       id: "control-plane-poll",
       status: "warning",
-      message: "Control-plane poll: NOT OBSERVABLE with tunnel-client 0.0.12 local inventory",
-    },
-  );
+      message: `Control Plane polling: NOT OBSERVABLE with tunnel-client ${version}`,
+    });
+  } else if (controlPlanePoll.state === "healthy") {
+    checks.push({
+      id: "control-plane-poll",
+      status: "ok",
+      message: "Control Plane polling: HEALTHY",
+      detail: `last successful poll unix timestamp: ${controlPlanePoll.timestamp}`,
+    });
+  } else if (controlPlanePoll.state === "never-succeeded") {
+    checks.push({
+      id: "control-plane-poll",
+      status: "error",
+      message: "Control Plane polling: NEVER SUCCEEDED",
+    });
+  } else {
+    checks.push({
+      id: "control-plane-poll",
+      status: "error",
+      message: "Control Plane polling: ERROR",
+      detail: controlPlanePoll.detail,
+    });
+  }
   return checks;
 }
 
@@ -250,7 +279,10 @@ export async function runDoctor(): Promise<DoctorReport> {
         : { id: "tunnel-service", status: "error", message: "macOS tunnel service is not fully running", detail: JSON.stringify(tunnelService) });
     }
     const runtime = tunnelStatus(config);
-    checks.push(...runtimeStateChecks(config, runtime));
+    const controlPlanePoll = runtime.processRunning
+      ? inspectControlPlanePoll(config)
+      : { state: "error" as const, detail: "tunnel process is not running" };
+    checks.push(...runtimeStateChecks(config, runtime, controlPlanePoll));
     checks.push({
       id: "connector",
       status: "warning",
