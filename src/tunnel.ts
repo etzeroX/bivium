@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { unzipSync } from "fflate";
 import type { AppConfig, BrowserInteractionMode, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
@@ -260,7 +260,7 @@ export function connectTunnel(config: AppConfig): void {
   if (result.status !== 0) {
     const detail = launchError && launchError !== "tunnel-client returned non-JSON connect output"
       ? launchError
-      : safeTunnelDetail(tunnelCommandOutput(result) || `exit ${result.status}`);
+      : `tunnel-client exited with status ${result.status} (diagnostic output withheld)`;
     throw new Error(`Tunnel managed startup failed: ${detail}`);
   }
   if (launchError) throw new Error(`Tunnel runtime exited during launch: ${launchError}`);
@@ -288,6 +288,93 @@ export interface TunnelRuntimeStatus {
   ready: boolean;
   state?: string;
   detail: string;
+}
+
+export type ControlPlanePollStatus =
+  | { state: "healthy"; timestamp: number }
+  | { state: "never-succeeded" }
+  | { state: "error"; detail: string }
+  | { state: "unsupported"; version: string };
+
+interface TunnelHealthReport {
+  control_plane_poll?: {
+    ok?: unknown;
+    value?: unknown;
+    error?: unknown;
+  };
+}
+
+export function parseControlPlanePollHealthReport(
+  output: string,
+  exitStatus = 0,
+): ControlPlanePollStatus {
+  let report: TunnelHealthReport;
+  try {
+    report = JSON.parse(output) as TunnelHealthReport;
+  } catch {
+    return { state: "error", detail: "tunnel-client returned an invalid control-plane health report" };
+  }
+  const poll = report && typeof report === "object" ? report.control_plane_poll : undefined;
+  if (!poll || typeof poll !== "object") {
+    return { state: "error", detail: "tunnel-client health report omitted the control-plane poll metric" };
+  }
+  if (poll.ok === true && typeof poll.value === "number" && Number.isFinite(poll.value) && poll.value > 0) {
+    return { state: "healthy", timestamp: poll.value };
+  }
+  if (poll.ok === false && (poll.value === undefined || poll.value === 0)
+    && poll.error === "no successful control-plane poll observed") {
+    return { state: "never-succeeded" };
+  }
+  const detail = typeof poll.error === "string" && /^(?:metrics endpoint returned HTTP )?[1-5][0-9]{2}(?: [A-Za-z ]+)?$/.test(poll.error)
+    ? `metrics endpoint returned HTTP ${poll.error.match(/[1-5][0-9]{2}/)![0]}`
+    : exitStatus !== 0
+      ? `tunnel-client health exited with status ${exitStatus}`
+      : "control-plane poll metric was invalid (diagnostic output withheld)";
+  return { state: "error", detail };
+}
+
+export function inspectControlPlanePoll(
+  config: AppConfig,
+  clientVersion = TUNNEL_VERSION,
+  execute: typeof runCommand = runCommand,
+): ControlPlanePollStatus {
+  const settings = tunnel(config);
+  if (clientVersion !== "0.0.14") return { state: "unsupported", version: clientVersion };
+  try {
+    const inventory = execute(
+      settings.binaryPath,
+      ["runtimes", "list", "--json"],
+      { timeout: 5_000 },
+    );
+    if (inventory.status !== 0) {
+      return { state: "error", detail: `local tunnel inventory failed with status ${inventory.status} (diagnostic output withheld)` };
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(inventory.stdout) as Record<string, unknown>;
+    } catch {
+      return { state: "error", detail: "local tunnel inventory returned invalid JSON" };
+    }
+    const aliases = parsed && typeof parsed === "object" && Array.isArray(parsed.aliases)
+      ? parsed.aliases.filter(entry => entry && typeof entry === "object"
+        && (entry as Record<string, unknown>).alias === settings.alias)
+      : [];
+    if (aliases.length !== 1) {
+      return { state: "error", detail: "local tunnel inventory has no unique configured alias" };
+    }
+    const healthURLFile = (aliases[0] as Record<string, unknown>).health_url_file;
+    if (typeof healthURLFile !== "string" || !isAbsolute(healthURLFile)) {
+      return { state: "error", detail: "local tunnel inventory has no absolute health URL file" };
+    }
+    const health = execute(
+      settings.binaryPath,
+      ["health", "--url-file", healthURLFile, "--require-control-plane-poll", "--json"],
+      { timeout: 5_000 },
+    );
+    return parseControlPlanePollHealthReport(health.stdout, health.status);
+  } catch {
+    return { state: "error", detail: "tunnel-client health command failed (diagnostic output withheld)" };
+  }
 }
 
 export function tunnelCommandOutput(result: {
@@ -332,6 +419,7 @@ export function tunnelConnectLaunchError(output: string): string | undefined {
   } catch {
     return "tunnel-client returned non-JSON connect output";
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "tunnel-client returned invalid connect output";
   const running = parsed.running === true;
   const healthy = parsed.healthy === true;
   const ready = parsed.ready === true;
@@ -349,15 +437,15 @@ export function tunnelConnectLaunchError(output: string): string | undefined {
     `healthy=${healthy}`,
     `ready=${ready}`,
     ...(exitCode !== undefined ? [`exit_code=${exitCode}`] : []),
-    ...(remoteError ? [`remote_error=${remoteError}`] : []),
-    ...(logTail ? [`runtime_log=${logTail}`] : []),
+    ...(remoteError ? ["remote_error=[withheld]"] : []),
+    ...(logTail ? ["runtime_log=[withheld]"] : []),
     ...(!remoteError && !logTail ? ["runtime did not complete a healthy launch"] : []),
   ].join("; "));
 }
 
 export function parseTunnelStatus(output: string, alias: string, exitStatus = 0): TunnelRuntimeStatus {
   if (exitStatus !== 0) {
-    return { ok: false, processRunning: false, healthy: false, ready: false, detail: safeTunnelDetail(output) };
+    return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client inventory exited with status ${exitStatus} (diagnostic output withheld)` };
   }
   try {
     const parsed = JSON.parse(output) as Record<string, unknown>;
@@ -385,7 +473,7 @@ export function parseTunnelStatus(output: string, alias: string, exitStatus = 0)
       ].join("; "));
     return { ok, processRunning, healthy, ready, state, detail };
   } catch (error) {
-    return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client returned invalid local inventory: ${safeTunnelDetail(error instanceof Error ? error.message : String(error))}` };
+    return { ok: false, processRunning: false, healthy: false, ready: false, detail: "tunnel-client returned invalid local inventory" };
   }
 }
 
