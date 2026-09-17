@@ -803,6 +803,34 @@ describe("reversible native Codex route integration", () => {
     expect(readFileSync(configPath, "utf8")).toBe('model = "gpt-5.6-sol"\n');
   });
 
+  test("accepts a semantic route rewrite but fails closed on a genuine external replacement", () => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    const original = 'model = "gpt-5.6-sol"\nopenai_base_url = "https://native.example/v1" # prior owner\n';
+    writeFileSync(configPath, original);
+
+    installCodexIntegration(nativeConfig("browser-only"), { replaceExistingRoute: true });
+    const semanticallyRewritten = readFileSync(configPath, "utf8").replace(
+      'openai_base_url = "http://127.0.0.1:17841/v1"',
+      "openai_base_url='http://127.0.0.1:17841/v1' # formatter",
+    );
+    writeFileSync(configPath, semanticallyRewritten);
+    expect(deactivateCodexIntegration()).toEqual({ changed: true, active: false });
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+
+    activateCodexIntegration();
+    const externallyReplaced = readFileSync(configPath, "utf8").replace(
+      'openai_base_url = "http://127.0.0.1:17841/v1"',
+      'openai_base_url = "https://external.example/v1"',
+    );
+    writeFileSync(configPath, externallyReplaced);
+    expect(() => uninstallCodexIntegration()).toThrow(
+      "openai_base_url changed after setup; refusing to overwrite the user's newer value",
+    );
+    expect(readFileSync(configPath, "utf8")).toBe(externallyReplaced);
+    expect(existsSync(getCodexJournalPath())).toBe(true);
+  });
+
   test("upgrades the released v9 route by adding the trusted Interrupt lifecycle hook", () => {
     const { codexHome } = fixture();
     const configPath = join(codexHome, "config.toml");

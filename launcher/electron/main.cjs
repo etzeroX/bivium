@@ -958,6 +958,10 @@ async function requestQuit() {
     if (activeOperation) {
       throw new Error(`Wait for ${activeOperation} to finish before quitting Codex Web GPT`);
     }
+    // openai_base_url routes both Web and Native models through the local daemon. Restore the
+    // journaled user route before removing that daemon so a normal launcher exit cannot strand
+    // Native Codex on a dead loopback endpoint. If restoration fails, keep the runtime alive.
+    if (!IS_DEV_PROFILE) await runtimeHost?.restoreBridgeRoute("launcher-quit-route-restore");
     await runtimeSupervisor?.shutdown({ cancelActiveTurns: true, force: true });
     stopCatalogVerificationMonitor();
     quitting = true;
