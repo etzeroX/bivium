@@ -354,6 +354,50 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
   expect(transactionTtl).toBe(MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
 });
 
+test.each(["complete", "cancel", "deadline"])("completed compaction source waits for physical release: %s", async outcome => {
+  let release!: () => void;
+  const source = new ChatGptTurnSession({
+    mode: "read-only", browser: Promise.resolve("source complete"),
+    physicalSettlement: new Promise<void>(resolve => { release = resolve; }),
+    trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
+    usageInput: request(false), conversationKey: chatGptConversationKey(request(false), "provider")!, cancel() {},
+  });
+  await source.browserOutcome;
+  const events: string[] = [];
+  const broker = {
+    beginCompactionTransaction: async () => {
+      events.push("transaction");
+      return { token: "control_11111111111111111111111111111111", handoffId: "handoff_22222222222222222222222222222222" };
+    },
+    waitForCompactionHandoff: async () => "checkpoint",
+    abortCompactionTransaction: () => {},
+  } as unknown as TurnBroker;
+  const worker = { run: async () => { events.push("browser"); return "finished"; } };
+  const abort = new AbortController();
+  const result = requestRetainedCompactionHandoff(worker as never, request(true), source, broker,
+    { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+    "trace_source_release", abort.signal, outcome === "deadline" ? 10 : 1000);
+  const observed = result.then(value => ({ value }), error => ({ error }));
+  try {
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    if (outcome === "complete") {
+      release();
+      expect(await observed).toEqual({ value: "checkpoint" });
+      expect(events).toEqual(["transaction", "browser"]);
+    } else {
+      if (outcome === "cancel") abort.abort(new Error("cancelled"));
+      expect(await observed).toHaveProperty("error");
+      expect(events).toEqual([]);
+    }
+  } finally {
+    abort.abort();
+    release();
+    await observed;
+  }
+});
+
 test("completed retained compaction never treats ordinary assistant text as a handoff", async () => {
   const sourceRequest = request(false);
   const source = new ChatGptTurnSession({

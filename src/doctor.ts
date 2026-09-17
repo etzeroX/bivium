@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getServiceStatus } from "./service";
-import { tunnelStatus } from "./tunnel";
+import {
+  inspectControlPlanePoll,
+  tunnelStatus,
+  type ControlPlanePollStatus,
+  type TunnelRuntimeStatus,
+} from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
 import {
   inspectLauncherBrowserHost,
@@ -27,6 +32,74 @@ export interface DoctorReport {
   ok: boolean;
   mode?: AppConfig["mode"];
   checks: DoctorCheck[];
+}
+
+export function runtimeStateChecks(
+  config: Pick<AppConfig, "mode" | "appName">,
+  runtime?: TunnelRuntimeStatus,
+  controlPlanePoll?: ControlPlanePollStatus,
+): DoctorCheck[] {
+  const full = config.mode === "full";
+  const checks: DoctorCheck[] = [
+    { id: "runtime-mode", status: "ok", message: `Runtime: ${config.mode}` },
+    {
+      id: "connector-identity",
+      status: "ok",
+      message: `Connector identity configured: YES (${config.appName})`,
+    },
+    { id: "local-tools", status: "ok", message: `Local tools: ${full ? "ENABLED" : "DISABLED"}` },
+    { id: "tunnel-config", status: "ok", message: `Tunnel: ${full ? "CONFIGURED" : "NOT CONFIGURED"}` },
+  ];
+  if (!full || !runtime) return checks;
+  checks.push(
+    {
+      id: "tunnel-process",
+      status: runtime.processRunning ? "ok" : "error",
+      message: `Tunnel process: ${runtime.processRunning ? "RUNNING" : "NOT RUNNING"}`,
+      ...(!runtime.processRunning ? { detail: runtime.detail } : {}),
+    },
+    {
+      id: "tunnel-health",
+      status: runtime.healthy ? "ok" : "error",
+      message: `Tunnel local health: ${runtime.healthy ? "HEALTHY" : "UNHEALTHY"}`,
+      ...(!runtime.healthy ? { detail: runtime.detail } : {}),
+    },
+    {
+      id: "tunnel-readiness",
+      status: runtime.ready ? "ok" : "error",
+      message: `Tunnel local readiness: ${runtime.ready ? "READY" : "NOT READY"}`,
+      ...(!runtime.ready ? { detail: runtime.detail } : {}),
+    },
+  );
+  if (!controlPlanePoll || controlPlanePoll.state === "unsupported") {
+    const version = controlPlanePoll?.state === "unsupported" ? controlPlanePoll.version : "unknown";
+    checks.push({
+      id: "control-plane-poll",
+      status: "warning",
+      message: `Control Plane polling: NOT OBSERVABLE with tunnel-client ${version}`,
+    });
+  } else if (controlPlanePoll.state === "healthy") {
+    checks.push({
+      id: "control-plane-poll",
+      status: "ok",
+      message: "Control Plane polling: HEALTHY",
+      detail: `last successful poll unix timestamp: ${controlPlanePoll.timestamp}`,
+    });
+  } else if (controlPlanePoll.state === "never-succeeded") {
+    checks.push({
+      id: "control-plane-poll",
+      status: "error",
+      message: "Control Plane polling: NEVER SUCCEEDED",
+    });
+  } else {
+    checks.push({
+      id: "control-plane-poll",
+      status: "error",
+      message: "Control Plane polling: ERROR",
+      detail: controlPlanePoll.detail,
+    });
+  }
+  return checks;
 }
 
 function secureFile(path: string): boolean {
@@ -206,9 +279,10 @@ export async function runDoctor(): Promise<DoctorReport> {
         : { id: "tunnel-service", status: "error", message: "macOS tunnel service is not fully running", detail: JSON.stringify(tunnelService) });
     }
     const runtime = tunnelStatus(config);
-    checks.push(runtime.ok
-      ? { id: "tunnel-runtime", status: "ok", message: "Tunnel runtime reports healthy and ready" }
-      : { id: "tunnel-runtime", status: "error", message: "Tunnel runtime is not ready", detail: runtime.detail });
+    const controlPlanePoll = runtime.processRunning
+      ? inspectControlPlanePoll(config)
+      : { state: "error" as const, detail: "tunnel process is not running" };
+    checks.push(...runtimeStateChecks(config, runtime, controlPlanePoll));
     checks.push({
       id: "connector",
       status: "warning",
@@ -216,7 +290,7 @@ export async function runDoctor(): Promise<DoctorReport> {
       detail: "Verify it once at https://chatgpt.com/#settings/Plugins while the tunnel is ready.",
     });
   } else {
-    checks.push({ id: "tools", status: "warning", message: "Browser-only mode intentionally has no local tools or MCP tunnel" });
+    checks.push(...runtimeStateChecks(config));
   }
 
   return {

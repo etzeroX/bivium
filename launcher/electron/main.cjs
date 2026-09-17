@@ -123,6 +123,38 @@ function publishOperation(operation) {
   send("launcher:operation", operation);
 }
 
+function enrichLauncherDoctorReport(report, state) {
+  if (report.mode !== "full") return report;
+  const catalogVerified = state.codexCatalogVerified === true;
+  const runtimeInstalled = state.mcpRuntimeInstalled === true;
+  const connectorVerified = state.mcpSetupComplete === true;
+  return {
+    ...report,
+    checks: [
+      ...report.checks.filter(check => !["catalog-verification", "mcp-runtime", "mcp-discovery"].includes(check.id)),
+      {
+        id: "mcp-runtime",
+        status: runtimeInstalled ? "ok" : "warning",
+        message: `MCP runtime installation: ${runtimeInstalled ? "INSTALLED" : "NOT INSTALLED"}`,
+      },
+      {
+        id: "mcp-discovery",
+        status: connectorVerified ? "ok" : "warning",
+        message: connectorVerified
+          ? "MCP connector discovery: VERIFIED"
+          : "MCP connector discovery: NOT VERIFIED",
+      },
+      {
+        id: "catalog-verification",
+        status: catalogVerified ? "ok" : "warning",
+        message: catalogVerified
+          ? "Codex model catalog: VERIFIED"
+          : "Waiting for restarted Codex to request the model catalog",
+      },
+    ],
+  };
+}
+
 function stopCatalogVerificationMonitor() {
   if (catalogVerificationTimer) clearInterval(catalogVerificationTimer);
   catalogVerificationTimer = null;
@@ -694,7 +726,10 @@ function registerIpc({ logger, stateStore }) {
     }
   });
 
-  handle("launcher:doctor", () => IS_DEV_PROFILE ? runtimeHost.devDoctor() : runtimeHost.doctor());
+  handle("launcher:doctor", async () => {
+    const report = IS_DEV_PROFILE ? await runtimeHost.devDoctor() : await runtimeHost.doctor();
+    return enrichLauncherDoctorReport(report, stateStore.read());
+  });
   handle("launcher:cancel-turns", () => {
     if (IS_DEV_PROFILE) throw new Error("DEV chat turns are owned by the repository CLI process");
     return runtimeHost.cancelActiveTurns();
@@ -958,6 +993,10 @@ async function requestQuit() {
     if (activeOperation) {
       throw new Error(`Wait for ${activeOperation} to finish before quitting Codex Web GPT`);
     }
+    // openai_base_url routes both Web and Native models through the local daemon. Restore the
+    // journaled user route before removing that daemon so a normal launcher exit cannot strand
+    // Native Codex on a dead loopback endpoint. If restoration fails, keep the runtime alive.
+    if (!IS_DEV_PROFILE) await runtimeHost?.restoreBridgeRoute("launcher-quit-route-restore");
     await runtimeSupervisor?.shutdown({ cancelActiveTurns: true, force: true });
     stopCatalogVerificationMonitor();
     quitting = true;

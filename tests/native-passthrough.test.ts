@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
+import { readJsonRequestBodyWithEncoded } from "../src/http-body";
 import { forwardNativeCodexRequest } from "../src/native-passthrough";
 
 test("forwards native Codex requests verbatim to the official backend", async () => {
@@ -36,6 +37,60 @@ test("forwards native Codex requests verbatim to the official backend", async ()
   expect(response.headers.get("content-type")).toContain("text/event-stream");
   expect(response.headers.get("connection")).toBeNull();
   expect(await response.text()).toBe("data: native\n\n");
+});
+
+test("reuses captured encoded bytes after routing parsed a large native request", async () => {
+  const source = JSON.stringify({
+    model: "gpt-5.6-sol",
+    stream: true,
+    input: [{ role: "user", content: "large-context-".repeat(100_000) }],
+  });
+  const compressed = Bun.zstdCompressSync(Buffer.from(source));
+  const encoded = new ArrayBuffer(compressed.byteLength);
+  new Uint8Array(encoded).set(compressed);
+  const request = new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer codex-oauth-token",
+      "content-type": "application/json",
+      "content-encoding": "zstd",
+    },
+    body: encoded,
+  });
+  const captured = await readJsonRequestBodyWithEncoded(request);
+  let upstreamRequest: Request | undefined;
+
+  await forwardNativeCodexRequest(request, "responses", async input => {
+    upstreamRequest = input;
+    return new Response("data: native\n\n", { headers: { "content-type": "text/event-stream" } });
+  }, captured.value, captured.encodedBody);
+
+  expect(request.bodyUsed).toBeTrue();
+  expect(upstreamRequest!.headers.get("content-encoding")).toBe("zstd");
+  expect(Buffer.from(await upstreamRequest!.arrayBuffer())).toEqual(Buffer.from(compressed));
+});
+
+test("parses an uncaptured native body without cloning its stream", async () => {
+  const clone = spyOn(Request.prototype, "clone");
+  try {
+    const body = JSON.stringify({ model: "gpt-5.6-sol", input: [{ role: "user", content: "Inspect" }] });
+    const request = new Request("http://127.0.0.1:17841/v1/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer codex-oauth-token", "content-type": "application/json" },
+      body,
+    });
+    let forwarded = "";
+
+    await forwardNativeCodexRequest(request, "responses", async input => {
+      forwarded = await input.text();
+      return new Response("data: native\n\n", { headers: { "content-type": "text/event-stream" } });
+    });
+
+    expect(forwarded).toBe(body);
+    expect(clone).not.toHaveBeenCalled();
+  } finally {
+    clone.mockRestore();
+  }
 });
 
 test("forwards native Codex compaction requests to the official compact endpoint", async () => {
