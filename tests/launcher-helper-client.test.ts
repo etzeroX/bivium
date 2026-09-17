@@ -1,6 +1,6 @@
 import { selectedSkillFile } from "../src/adapters/chatgpt-web/skill-attachments";
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
@@ -404,6 +404,178 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
     code: "rate_limit_exceeded",
     retryable: true,
   });
+});
+
+test("terminal errors and Stopped thinking retire only their own concurrent helper turns", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused-state.json",
+    chromeExecutablePath: "/durable/unused-chrome",
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+  });
+  const internal = client as unknown as {
+    child?: unknown;
+    pending: Map<string, unknown>;
+    ensureChild(): Promise<void>;
+    send(message: Record<string, unknown>): Promise<void>;
+    handleLine(child: unknown, line: string): void;
+  };
+  const child = {};
+  internal.child = child;
+  internal.ensureChild = async () => {};
+  internal.send = async message => {
+    if (message.type === "run") {
+      const id = String(message.id);
+      queueMicrotask(() => {
+        if (id === "terminal_turn_a") {
+          internal.handleLine(child, JSON.stringify({
+            type: "error", id, name: "ChatGptWebAdapterError",
+            message: "ChatGPT ended this response with a terminal error",
+            status: 502, errorType: "server_error", code: "upstream_server_error", retryable: true,
+          }));
+        } else if (id === "stopped_turn_b") {
+          internal.handleLine(child, JSON.stringify({
+            type: "error", id, name: "ChatGptWebAdapterError",
+            message: "ChatGPT displayed 'Stopped thinking'",
+            status: 502, errorType: "server_error", code: "chatgpt_stopped_thinking", retryable: false,
+          }));
+        } else {
+          internal.handleLine(child, JSON.stringify({
+            type: "event", id, event: "prepared_selected", reused: false,
+          }));
+        }
+      });
+    } else if (message.type === "prepared_selected_ack") {
+      queueMicrotask(() => internal.handleLine(child, JSON.stringify({
+        type: "result", id: message.id, text: "turn C completed",
+      })));
+    }
+  };
+
+  const released: string[] = [];
+  const turn = (traceId: string): BrowserTurn => ({
+    traceId,
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: traceId, images: [], release: () => { released.push(traceId); } }),
+    onTextDelta() {},
+  });
+
+  const [terminal, stopped, completed] = await Promise.allSettled([
+    client.run(turn("terminal_turn_a")),
+    client.run(turn("stopped_turn_b")),
+    client.run(turn("healthy_turn_c")),
+  ]);
+
+  expect(terminal).toMatchObject({ status: "rejected", reason: { code: "upstream_server_error" } });
+  expect(stopped).toMatchObject({ status: "rejected", reason: { code: "chatgpt_stopped_thinking" } });
+  expect(completed).toEqual({ status: "fulfilled", value: "turn C completed" });
+  expect(released).toEqual(["healthy_turn_c"]);
+  expect(internal.pending.size).toBe(0);
+});
+
+test("a helper process death fails every pending turn and the next turn starts on a fresh helper", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-helper-process-restart-"));
+  roots.push(root);
+  const generationPath = join(root, "generation.txt");
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    const fs = require("node:fs");
+    const readline = require("node:readline");
+    const generationPath = ${JSON.stringify(generationPath)};
+    const previous = fs.existsSync(generationPath) ? Number(fs.readFileSync(generationPath, "utf8")) : 0;
+    const generation = previous + 1;
+    fs.writeFileSync(generationPath, String(generation));
+    const write = value => process.stdout.write(JSON.stringify(value) + "\\n");
+    const firstGenerationRuns = new Set();
+    write({ type: "ready", features: [] });
+    readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+      const message = JSON.parse(line);
+      if (message.type === "shutdown") process.exit(0);
+      if (message.type === "run") {
+        if (generation === 1) {
+          firstGenerationRuns.add(message.id);
+          if (firstGenerationRuns.size === 2) setTimeout(() => process.exit(47), 10);
+        } else {
+          write({ type: "event", id: message.id, event: "prepared_selected", reused: false });
+        }
+      }
+      if (generation > 1 && message.type === "prepared_selected_ack") {
+        write({ type: "result", id: message.id, text: "fresh helper completed" });
+      }
+    });
+  `, { mode: 0o700 });
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: async request => {
+      await request.json();
+      return Response.json({ ok: true, cancelledByUser: false });
+    },
+  });
+  const descriptorPath = join(root, "launcher.json");
+  writeFileSync(descriptorPath, JSON.stringify({
+    version: 3,
+    kind: LAUNCHER_BROWSER_HOST_KIND,
+    profile: "production",
+    pid: process.pid,
+    endpoint: `http://127.0.0.1:${server.port}`,
+    control: {
+      endpoint: `http://127.0.0.1:${server.port}`,
+      token: "launcher-control-token-0123456789abcdefghijklmnop",
+    },
+    helper: { executable: process.execPath, script: helper },
+    partition: "persist:codex-web-gpt-chatgpt",
+    idleUrl: LAUNCHER_BROWSER_IDLE_URL,
+    surfaceId: "launcher_surface_id_0123456789AB",
+    surfaceTargets: { launcher_surface_id_0123456789AB: "native-owned-target" },
+    createdAt: new Date().toISOString(),
+  }), { mode: 0o600 });
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+  });
+  const internal = client as unknown as { pending: Map<string, unknown> };
+  const turn = (traceId: string): BrowserTurn => ({
+    traceId,
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: traceId, images: [], release() {} }),
+    onTextDelta() {},
+  });
+  try {
+    const failed = await Promise.allSettled([
+      client.run(turn("helper_crash_turn_a")),
+      client.run(turn("helper_crash_turn_b")),
+    ]);
+    expect(failed).toHaveLength(2);
+    for (const result of failed) {
+      expect(result).toMatchObject({
+        status: "rejected",
+        reason: { message: expect.stringContaining("status 47") },
+      });
+    }
+    expect(internal.pending.size).toBe(0);
+    await expect(client.run(turn("helper_restart_turn_c"))).resolves.toBe("fresh helper completed");
+    expect(Number(readFileSync(generationPath, "utf8"))).toBe(2);
+    expect(internal.pending.size).toBe(0);
+  } finally {
+    await client.close();
+    await server.stop(true);
+  }
 });
 
 test("an older helper cannot silently drop selected skill files and releases the prepared turn", async () => {
