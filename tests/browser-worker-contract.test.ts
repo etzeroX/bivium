@@ -2691,6 +2691,33 @@ test.each([
   });
 });
 
+test("an expired session remains authoritative when a message-too-long alert also exists", async () => {
+  const texts = [
+    "The message you submitted was too long. Please submit something shorter.",
+    "Your session has expired. Please log in again to continue using the app.",
+  ];
+  const page = {
+    locator: () => ({
+      filter: ({ hasText }: { hasText: string | RegExp }) => {
+        const visible = texts.some(text => typeof hasText === "string" ? text.includes(hasText) : hasText.test(text));
+        const filtered = {
+          last: () => filtered,
+          isVisible: async () => visible,
+        };
+        return filtered;
+      },
+    }),
+  } as unknown as Page;
+
+  await expect(throwIfChatGptSessionFailureAlert(page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 401,
+    errorType: "authentication_error",
+    code: "chatgpt_session_expired",
+    retryable: false,
+  });
+});
+
 test("effort selection stops as soon as ChatGPT reports an expired session", async () => {
   const neverVisible = new Promise<void>(() => {});
   const effortControl = {
