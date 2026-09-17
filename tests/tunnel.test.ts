@@ -61,7 +61,7 @@ describe("tunnel status boundary", () => {
       "ours",
       1,
     );
-    expect(result.detail).toBe("failed [tunnel-id] with [redacted-key]");
+    expect(result.detail).toBe("tunnel-client inventory exited with status 1 (diagnostic output withheld)");
     expect(result.detail).not.toContain("0123456789abcdef");
   });
 
@@ -77,7 +77,7 @@ describe("tunnel status boundary", () => {
     }));
 
     expect(detail).toBe(
-      "running=false; healthy=false; ready=false; exit_code=1; runtime_log=403 for [tunnel-id] using [redacted-key]",
+      "running=false; healthy=false; ready=false; exit_code=1; runtime_log=[withheld]",
     );
   });
 
