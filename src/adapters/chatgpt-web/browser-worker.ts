@@ -81,6 +81,7 @@ import {
   ChatGptCompactionHandoffAccepted,
   ChatGptWebAdapterError,
   chatGptBrowserTabClosedError,
+  chatGptMessageTooLongError,
   chatGptRetainedConversationUnavailableError,
   chatGptStoppedThinkingError,
 } from "./adapter-error";
@@ -786,7 +787,17 @@ const chatGptExpiredSessionAlert = (page: Page): Locator => page
   .filter({ hasText: /Your session has expired|你的工作階段已過期|您的工作階段已過期|你的会话已过期|您的会话已过期/i })
   .last();
 
+const chatGptMessageTooLongAlert = (page: Page): Locator => page
+  .locator('[role="alert"], [role="dialog"]')
+  .filter({
+    hasText: /(?:message (?:you (?:sent|submitted)|is) (?:was |is )?too long|mensaje que (?:enviaste|has enviado)[\s\S]{0,80}demasiado largo|消息[\s\S]{0,40}(?:太长|過長)|訊息[\s\S]{0,40}(?:太長|過長)|メッセージ[\s\S]{0,40}長すぎ)/i,
+  })
+  .last();
+
 export async function throwIfChatGptSessionFailureAlert(page: Page): Promise<void> {
+  if (await chatGptMessageTooLongAlert(page).isVisible().catch(() => false)) {
+    throw chatGptMessageTooLongError();
+  }
   if (await chatGptExpiredSessionAlert(page).isVisible().catch(() => false)) {
     throw new ChatGptWebAdapterError(
       "The ChatGPT session has expired. Sign in again in Codex Web GPT.",

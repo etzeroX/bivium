@@ -1094,6 +1094,18 @@ export function createChatGptWebAdapter(
               }
               const handoffError = error instanceof Error ? error : new Error(String(error));
               console.error("[chatgpt-web] structured context handoff failed:", handoffError);
+              if (handoffError instanceof ChatGptWebAdapterError
+                && handoffError.code === "chatgpt_message_too_long") {
+                emit({
+                  type: "error",
+                  message: handoffError.message,
+                  status: handoffError.status,
+                  errorType: handoffError.errorType,
+                  code: handoffError.code,
+                  retryable: handoffError.retryable,
+                });
+                return;
+              }
               emit({
                 type: "error",
                 message: "ChatGPT did not complete the context handoff. Retry the task.",
