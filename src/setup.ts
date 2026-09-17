@@ -621,15 +621,9 @@ async function performSetup(options: SetupOptions): Promise<SetupResult> {
     await uninstallService(existing!);
   }
   if (launcherOwned) saveConfig(config);
-  // Keep the previous terminal runtime intact through the ownership handoff. A later launcher
-  // setup removes it once the launcher-owned configuration is already the established baseline.
-  const migratingTerminalRuntime = Boolean(
-    launcherOwned && existing && existing.browserHost !== "launcher",
-  );
   installCodexIntegration(config, {
     replaceExistingRoute: options.replaceCodexRoute,
   });
-  if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
 
   return {
     mode: config.mode,
@@ -665,6 +659,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     for (const managed of setupManagedFilePaths()) {
       transaction.track(managed.path, { followSymlink: managed.followSymlink });
     }
+    const previousConfig = loadExistingConfig();
     preflightSetup(options);
     transaction.prepared();
     const result = await performSetup(options);
@@ -684,6 +679,18 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     }
     transaction.verified();
     transaction.commit();
+    // Legacy directory removal is irreversible and must not precede final verification. Keep the
+    // old terminal runtime through ownership migration; cleanup failure cannot undo a committed
+    // installation or masquerade as a transaction rollback.
+    const migratingTerminalRuntime = committedConfig.browserHost === "launcher"
+      && previousConfig && previousConfig.browserHost !== "launcher";
+    if (!migratingTerminalRuntime) {
+      try {
+        removeLegacyRuntimeArtifacts(committedConfig);
+      } catch {
+        console.warn("Setup committed; obsolete runtime artifacts could not be removed");
+      }
+    }
     return result;
   } catch (error) {
     return transaction.rollback(error);
