@@ -1,4 +1,4 @@
-import { readJsonRequestBody } from "./http-body";
+import { decodeJsonRequestBody } from "./http-body";
 import {
   BRIDGE_COMPACTION_PREFIX,
   SUMMARY_PREFIX,
@@ -210,6 +210,7 @@ export async function forwardNativeCodexRequest(
   endpoint: NativeCodexEndpoint,
   fetchUpstream: NativeFetch = fetchNativeCodex,
   decodedBody?: unknown,
+  encodedBody?: ArrayBuffer,
 ): Promise<Response> {
   const authorization = request.headers.get("authorization") ?? "";
   if (!authorization.startsWith("Bearer ") || authorization.length <= "Bearer ".length) {
@@ -232,9 +233,10 @@ export async function forwardNativeCodexRequest(
     // Standalone image requests use their own schema; never interpret them as Responses history.
     body = await request.arrayBuffer();
   } else if (method === "POST") {
-    const parseRequest = decodedBody === undefined ? request.clone() : undefined;
-    const originalBody = await request.arrayBuffer();
-    const parsedBody = decodedBody === undefined ? await readJsonRequestBody(parseRequest!) : decodedBody;
+    const originalBody = encodedBody ?? await request.arrayBuffer();
+    const parsedBody = decodedBody === undefined
+      ? await decodeJsonRequestBody(originalBody, request.headers)
+      : decodedBody;
     if (isObject(parsedBody)) {
       if (typeof parsedBody.model === "string" && /^[A-Za-z0-9_./:-]{1,128}$/.test(parsedBody.model)) {
         model = parsedBody.model;

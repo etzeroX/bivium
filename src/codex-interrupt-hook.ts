@@ -136,7 +136,7 @@ function hookTextPattern(text: string): string {
     .join("(?:\\r\\n|\\n|\\r)");
 }
 
-function locateCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): Array<{
+function locateExactCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): Array<{
   start: number; end: number;
 }> {
   const marker = installed.fragment.indexOf(MANAGED_INTERRUPT_HOOK_END);
@@ -186,6 +186,10 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
     if (definitions(parsed, installed.groupIndex) !== definitions(expected, 0)) {
       throw new Error("Modified owned definitions");
     }
+    const groups = (parsed as { hooks: { Interrupt: Array<{ hooks?: Array<{ command?: string }> }> } }).hooks.Interrupt;
+    if (groups.flatMap(group => (group.hooks ?? []).filter(hook => hook.command === installed.command)).length !== 1) {
+      throw new Error("Ambiguous hook ownership");
+    }
   } catch {
     throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
   }
@@ -201,6 +205,112 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
   const trailing = installed.fragment.slice(marker + MANAGED_INTERRUPT_HOOK_END.length);
   const trailingLength = new RegExp("^" + hookTextPattern(trailing)).exec(text.slice(end))?.[0].length ?? 0;
   return [...ranges, { start: endMarker, end: end + trailingLength }];
+}
+
+type HookRange = { start: number; end: number };
+
+function locateSemanticCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): HookRange[] {
+  const parse = (source: string) => Bun.TOML.parse(source.replace(/\r\n?/g, "\n"));
+  const equal = (left: unknown, right: unknown) => JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right));
+  type HookDocument = { hooks: { Interrupt: unknown[]; state: Record<string, unknown> } };
+  if (!Number.isSafeInteger(installed.groupIndex) || installed.groupIndex < 0
+    || codexInterruptHookHash(installed.command) !== installed.trustedHash
+    || managedMarkerCount(installed.fragment) !== 1
+    || installed.fragment.split(MANAGED_INTERRUPT_HOOK_END).length !== 2) throw new Error("Invalid hook journal identity");
+  const document = parse(text) as HookDocument;
+  const journal = parse(installed.fragment) as HookDocument;
+  const expectedGroup = { hooks: [{ type: "command", command: installed.command, timeout: 3 }] };
+  const expectedState = { trusted_hash: installed.trustedHash };
+  if (!equal(journal.hooks.Interrupt, [expectedGroup])
+    || !equal(journal.hooks.state, { [installed.stateKey]: expectedState })
+    || !equal(document.hooks.Interrupt[installed.groupIndex], expectedGroup)
+    || !equal(document.hooks.state[installed.stateKey], expectedState)) throw new Error("Modified hook identity");
+  // A second occurrence of the owned command is ambiguous even when its other fields differ.
+  const commands = document.hooks.Interrupt.flatMap(group =>
+    ((group as { hooks?: Array<{ command?: string }> }).hooks ?? []).filter(hook => hook.command === installed.command));
+  if (commands.length !== 1) throw new Error("Ambiguous hook ownership");
+  if (managedMarkerCount(text) > 1 || text.split(MANAGED_INTERRUPT_HOOK_END).length > 2) {
+    throw new Error("Ambiguous hook markers");
+  }
+
+  const ranges: HookRange[] = [];
+  let groupIndex = -1;
+  let ownedSection = false;
+  let groupHeaders = 0;
+  let commandHeaders = 0;
+  let stateHeaders = 0;
+  // These are candidate source ranges, not proof. The full-document comparison below must
+  // demonstrate that removing them changes ONLY the journal-owned definitions. In particular,
+  // header-looking text inside multiline strings cannot establish ownership.
+  for (const match of text.matchAll(/[^\r\n]+(?:\r\n|\n|\r|$)|(?:\r\n|\n|\r)/g)) {
+    const raw = match[0];
+    const line = raw.replace(/[\r\n]+$/, "");
+    const trimmed = line.trim();
+    let header: unknown;
+    if (trimmed.startsWith("[")) {
+      try { header = parse(line); } catch { /* Not a complete TOML table header. */ }
+    }
+    if (header !== undefined) {
+      ownedSection = false;
+      if (equal(header, { hooks: { Interrupt: [{}] } })) {
+        groupIndex++;
+        ownedSection = groupIndex === installed.groupIndex;
+        if (ownedSection) groupHeaders++;
+      } else if (equal(header, { hooks: { Interrupt: { hooks: [{}] } } })) {
+        ownedSection = groupIndex === installed.groupIndex;
+        if (ownedSection) commandHeaders++;
+      } else if (equal(header, { hooks: { state: { [installed.stateKey]: {} } } })) {
+        ownedSection = true;
+        stateHeaders++;
+      }
+    }
+    if (trimmed === MANAGED_INTERRUPT_HOOK_START || trimmed === MANAGED_INTERRUPT_HOOK_END) {
+      ranges.push({ start: match.index!, end: match.index! + raw.length });
+    } else if (ownedSection && trimmed && !trimmed.startsWith("#")) {
+      // Keep user comments verbatim, including inline comments. A # inside a quoted value is
+      // not a comment: only a prefix that parses identically to the complete line qualifies.
+      let length = raw.length;
+      for (let hash = line.indexOf("#"); hash >= 0; hash = line.indexOf("#", hash + 1)) {
+        try {
+          if (equal(parse(line), parse(line.slice(0, hash)))) { length = hash; break; }
+        } catch { /* A quoted # or part of a multiline assignment. */ }
+      }
+      ranges.push({ start: match.index!, end: match.index! + length });
+    }
+  }
+  if (groupHeaders !== 1 || commandHeaders !== 1 || stateHeaders !== 1) throw new Error("Ambiguous hook source ranges");
+  let restored = text;
+  for (const range of [...ranges].sort((a, b) => b.start - a.start)) {
+    restored = restored.slice(0, range.start) + restored.slice(range.end);
+  }
+  const expected = structuredClone(document);
+  expected.hooks.Interrupt.splice(installed.groupIndex, 1);
+  delete expected.hooks.state[installed.stateKey];
+  // Removing the last owned child may leave an implicit empty parent in one parse result.
+  const prune = (value: HookDocument) => {
+    const hooks = value.hooks as Partial<HookDocument["hooks"]> | undefined;
+    if (hooks?.Interrupt?.length === 0) delete hooks.Interrupt;
+    if (hooks?.state && Object.keys(hooks.state).length === 0) delete hooks.state;
+    if (hooks && Object.keys(hooks).length === 0) delete (value as Partial<HookDocument>).hooks;
+    return value;
+  };
+  if (!equal(prune(parse(restored) as HookDocument), prune(expected))) {
+    throw new Error("Hook source removal changes unrelated TOML values");
+  }
+  return ranges;
+}
+
+function locateCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): HookRange[] {
+  try {
+    return locateExactCodexInterruptHook(text, installed);
+  } catch (exactError) {
+    try {
+      return locateSemanticCodexInterruptHook(text, installed);
+    } catch {
+      // Preserve the established precise diagnostics for genuinely modified/invalid ownership.
+      throw exactError;
+    }
+  }
 }
 
 export function verifyCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): void {
