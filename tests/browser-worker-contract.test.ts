@@ -2675,6 +2675,22 @@ test.each([
   });
 });
 
+test.each([
+  "The message you submitted was too long. Please reload the conversation and submit something shorter.",
+  "El mensaje que enviaste era demasiado largo. Vuelve a cargar la conversación y envía algo más corto.",
+  "您提交的消息太长，请重新加载对话并提交较短的内容。",
+  "送信したメッセージが長すぎます。会話を再読み込みして、短いメッセージを送信してください。",
+])("an explicit product message limit is not reported as a generic handoff timeout: %s", async alertText => {
+  const fixture = dialogPage(alertText);
+  await expect(throwIfChatGptSessionFailureAlert(fixture.page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 413,
+    errorType: "invalid_request_error",
+    code: "chatgpt_message_too_long",
+    retryable: false,
+  });
+});
+
 test("effort selection stops as soon as ChatGPT reports an expired session", async () => {
   const neverVisible = new Promise<void>(() => {});
   const effortControl = {
