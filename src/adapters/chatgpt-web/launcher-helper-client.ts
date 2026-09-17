@@ -5,6 +5,10 @@ import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
+import {
+  chatGptTextIntegrityDiagnosticsEnabled,
+  reportCompiledChatGptPromptIntegrity,
+} from "./text-integrity";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
 import {
   parseChatGptLunaCheckpoint,
@@ -518,6 +522,9 @@ export class LauncherBrowserHelperClient {
             return;
           }
           pending.prepared = prepared;
+          if (chatGptTextIntegrityDiagnosticsEnabled()) {
+            reportCompiledChatGptPromptIntegrity(message.id, "helper_ipc_send", prepared);
+          }
           if (prepared.skillFiles?.length && !this.helperFeatures.has("skill-attachments")) {
             throw new Error("Launcher browser helper does not support skill attachments; update or restart the launcher");
           }

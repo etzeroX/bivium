@@ -85,6 +85,12 @@ import {
   chatGptStoppedThinkingError,
 } from "./adapter-error";
 import {
+  chatGptTextIntegrityDiagnosticsEnabled,
+  chatGptTextIntegrityFingerprint,
+  reportChatGptTextIntegrity,
+  reportCompiledChatGptPromptIntegrity,
+} from "./text-integrity";
+import {
   ChatGptLunaCheckpointStream,
   type CapturedChatGptLunaCheckpoint,
 } from "./rolling-checkpoint";
@@ -2802,6 +2808,27 @@ export class ChatGptBrowserWorker {
     return (await this.responseDomSnapshot(locator, {})).visibleText;
   }
 
+  private async submittedUserTurnText(
+    page: Page,
+    baseline: ChatGptSubmissionBaseline,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const state = await this.submissionDomState(page, baseline.domCache, signal);
+    const identity = chatGptNewTurnIdentity(
+      baseline.initialTurnIdentities,
+      state.userIdentities,
+    );
+    if (!identity) return undefined;
+    const locator = page.locator(`[data-turn-id=${JSON.stringify(identity)}]`);
+    return locator.evaluate(element => {
+      const clone = element.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll(
+        '[data-id^="plugin:"][data-keyword], [data-inline-selection-pill-cursor-target]',
+      ).forEach(part => part.remove());
+      return (clone.innerText ?? clone.textContent ?? "").trimStart();
+    }, undefined, { timeout: 20_000, signal });
+  }
+
   private async captureSubmissionBaseline(page: Page): Promise<ChatGptSubmissionBaseline> {
     const userTurns = page.locator(CHATGPT_USER_TURN_SELECTOR);
     const responseTurns = page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR);
@@ -4423,6 +4450,9 @@ export class ChatGptBrowserWorker {
     const prepare = reuseConversation ? turn.prepareResume : turn.prepare;
     if (!prepare) throw new Error("The retained ChatGPT conversation has no continuation prompt");
     const prepared = await prepare();
+    if (chatGptTextIntegrityDiagnosticsEnabled()) {
+      reportCompiledChatGptPromptIntegrity(turn.traceId, "browser_worker_received", prepared);
+    }
     const diagnostics = new ChatGptBrowserDiagnostics(
       turn.traceId,
       this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
@@ -4825,6 +4855,24 @@ export class ChatGptBrowserWorker {
         }
       }
       await diagnostics.capture(page, "prompt-attachment-complete");
+      if (chatGptTextIntegrityDiagnosticsEnabled()) {
+        try {
+          const composerText = await this.attachedPromptText(page, turn.abortSignal);
+          reportChatGptTextIntegrity(turn.traceId, "composer_attached", [{
+            name: "composer_text",
+            text: composerText,
+          }], {
+            observed: true,
+            matchesCompiled: this.promptTextEquivalent(finalPrompt, composerText),
+            compiledSha256: chatGptTextIntegrityFingerprint(finalPrompt).sha256,
+          });
+        } catch {
+          reportChatGptTextIntegrity(turn.traceId, "composer_attached", [], {
+            observed: false,
+            compiledSha256: chatGptTextIntegrityFingerprint(finalPrompt).sha256,
+          });
+        }
+      }
       await this.runStage(turn.traceId, "file_attachment", browserStageTimeouts.fileAttachment, () => (
         this.attachFiles(page, prepared)
       ));
@@ -4854,6 +4902,29 @@ export class ChatGptBrowserWorker {
         ),
       );
       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);
+      if (chatGptTextIntegrityDiagnosticsEnabled()) {
+        try {
+          const submittedText = await this.submittedUserTurnText(
+            page,
+            submissionBaseline,
+            turn.abortSignal,
+          );
+          reportChatGptTextIntegrity(turn.traceId, "submitted_user_turn", submittedText === undefined ? [] : [{
+            name: "visible_user_text",
+            text: submittedText,
+          }], {
+            observed: submittedText !== undefined,
+            matchesCompiled: submittedText !== undefined
+              && this.promptTextEquivalent(finalPrompt, submittedText),
+            compiledSha256: chatGptTextIntegrityFingerprint(finalPrompt).sha256,
+          });
+        } catch {
+          reportChatGptTextIntegrity(turn.traceId, "submitted_user_turn", [], {
+            observed: false,
+            compiledSha256: chatGptTextIntegrityFingerprint(finalPrompt).sha256,
+          });
+        }
+      }
       let responseTurn = await this.waitForNewAssistantTurn(
         page,
         submissionBaseline,

@@ -8,6 +8,10 @@ import type { ChatGptWebCapabilities } from "./model";
 import { createProcessLineWriter } from "./process-line-writer";
 import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-selection";
 import type { CompiledChatGptWebPrompt } from "./prompt";
+import {
+  chatGptTextIntegrityDiagnosticsEnabled,
+  reportCompiledChatGptPromptIntegrity,
+} from "./text-integrity";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
 
@@ -416,6 +420,9 @@ input.on("line", line => {
         abortControllers.get(message.id)?.abort();
         return;
       }
+    }
+    if (chatGptTextIntegrityDiagnosticsEnabled()) {
+      reportCompiledChatGptPromptIntegrity(message.id, "helper_ipc_receive", prepared);
     }
     const selection = preparedSelections.get(message.id);
     if (!selection) {
