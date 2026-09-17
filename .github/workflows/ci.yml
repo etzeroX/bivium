@@ -15,6 +15,9 @@ jobs:
       matrix:
         os: [macos-15, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Bivium ships Windows and Linux as required gates. Keep macOS running for signal without
+    # allowing an exclusive macOS packaging failure to block those supported targets.
+    continue-on-error: ${{ matrix.os == 'macos-15' }}
     steps:
       - uses: actions/checkout@v6
       - name: Validate launcher installer with Windows PowerShell 5.1

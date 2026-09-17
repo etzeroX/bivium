@@ -124,6 +124,10 @@ test("launcher UI localizes MCP verification progress and doctor check messages"
   );
 });
 
+test("catalog wait copy names the observable event", () => {
+  const { copyFor } = loadI18nModule();
+  assert.equal(copyFor("en").mcpCatalogRequired, "Waiting for restarted Codex to request the model catalog");
+});
 
 
 test("native dialogs and IPC accept exactly the renderer's supported languages", () => {
