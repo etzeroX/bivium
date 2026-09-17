@@ -1,4 +1,8 @@
 import { chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
+import {
+  chatGptTextIntegrityDiagnosticsEnabled,
+  reportChatGptTextIntegrity,
+} from "./adapters/chatgpt-web/text-integrity";
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { timingSafeEqual } from "node:crypto";
@@ -618,6 +622,19 @@ export async function responseRequest(
     }), {
       status: 400,
       headers: { "content-type": "application/json" },
+    });
+  }
+  if (traceId && chatGptTextIntegrityDiagnosticsEnabled()) {
+    reportChatGptTextIntegrity(traceId, "responses_input", [{
+      name: "body",
+      text: JSON.stringify(raw),
+    }]);
+    reportChatGptTextIntegrity(traceId, "parsed_messages", [{
+      name: "messages",
+      text: JSON.stringify(parsed.context.messages),
+    }], {
+      messages: parsed.context.messages.length,
+      systemPrompts: parsed.context.systemPrompt?.length ?? 0,
     });
   }
   const adapter = adapterFactory(provider);
