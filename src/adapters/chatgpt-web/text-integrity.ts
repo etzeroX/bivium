@@ -43,6 +43,9 @@ export function chatGptTextIntegrityFingerprint(text: string): ChatGptTextIntegr
   };
 }
 
+const CHATGPT_TEXT_INTEGRITY_TRACE_ID = /^[a-f0-9]{12}(?:_fallback)?$/;
+const CHATGPT_TEXT_INTEGRITY_BOUNDARY = /^[a-z0-9_]+$/;
+
 export function reportChatGptTextIntegrity(
   traceId: string,
   boundary: string,
@@ -50,18 +53,27 @@ export function reportChatGptTextIntegrity(
   detail?: Record<string, string | number | boolean | null>,
 ): void {
   if (!chatGptTextIntegrityDiagnosticsEnabled()) return;
-  if (!/^[a-f0-9]{12}$/.test(traceId)) throw new Error("ChatGPT text-integrity trace id is invalid");
-  if (!/^[a-z0-9_]+$/.test(boundary)) throw new Error("ChatGPT text-integrity boundary is invalid");
-  console.info(`[chatgpt-web] text-integrity ${JSON.stringify({
-    version: 1,
-    traceId,
-    boundary,
-    segments: segments.map(segment => ({
-      name: segment.name,
-      ...chatGptTextIntegrityFingerprint(segment.text),
-    })),
-    ...(detail ? { detail } : {}),
-  })}`);
+
+  // Diagnostics are a side channel and must never affect turn execution.
+  // Accept only adapter-owned trace identities and safe boundary names; anything
+  // unexpected is omitted instead of being allowed to fail production work.
+  if (!CHATGPT_TEXT_INTEGRITY_TRACE_ID.test(traceId)) return;
+  if (!CHATGPT_TEXT_INTEGRITY_BOUNDARY.test(boundary)) return;
+
+  try {
+    console.info(`[chatgpt-web] text-integrity ${JSON.stringify({
+      version: 1,
+      traceId,
+      boundary,
+      segments: segments.map(segment => ({
+        name: segment.name,
+        ...chatGptTextIntegrityFingerprint(segment.text),
+      })),
+      ...(detail ? { detail } : {}),
+    })}`);
+  } catch {
+    // Diagnostic reporting must never replace or alter the source turn result.
+  }
 }
 
 export function reportCompiledChatGptPromptIntegrity(
