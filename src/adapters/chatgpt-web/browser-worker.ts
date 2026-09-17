@@ -794,15 +794,19 @@ const chatGptMessageTooLongAlert = (page: Page): Locator => page
   })
   .last();
 
+const chatGptSessionExpiredError = (): ChatGptWebAdapterError => new ChatGptWebAdapterError(
+  "The ChatGPT session has expired. Sign in again in Codex Web GPT.",
+  { status: 401, errorType: "authentication_error", code: "chatgpt_session_expired", retryable: false },
+);
+
 export async function throwIfChatGptSessionFailureAlert(page: Page): Promise<void> {
+  // Authentication state is page-authoritative. A stale turn-level product alert can coexist
+  // with the session dialog, but it must not downgrade an expired session into a payload error.
+  if (await chatGptExpiredSessionAlert(page).isVisible().catch(() => false)) {
+    throw chatGptSessionExpiredError();
+  }
   if (await chatGptMessageTooLongAlert(page).isVisible().catch(() => false)) {
     throw chatGptMessageTooLongError();
-  }
-  if (await chatGptExpiredSessionAlert(page).isVisible().catch(() => false)) {
-    throw new ChatGptWebAdapterError(
-      "The ChatGPT session has expired. Sign in again in Codex Web GPT.",
-      { status: 401, errorType: "authentication_error", code: "chatgpt_session_expired", retryable: false },
-    );
   }
   if (!await chatGptSubscriptionFailureAlert(page).isVisible().catch(() => false)) return;
   throw new ChatGptWebAdapterError(
@@ -2420,7 +2424,7 @@ export class ChatGptBrowserWorker {
         currentEffort.waitFor({ state: "visible", timeout: 70_000, signal: effortWaitAbort.signal }).then(() => "effort" as const),
         chatGptExpiredSessionAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: effortWaitAbort.signal }).then(() => "session-expired" as const),
       ]);
-      if (ready === "session-expired") await throwIfChatGptSessionFailureAlert(page);
+      if (ready === "session-expired") throw chatGptSessionExpiredError();
     } catch (error) {
       if (error instanceof ChatGptWebAdapterError) throw error;
       await throwIfChatGptSessionFailureAlert(page);
@@ -2451,7 +2455,7 @@ export class ChatGptBrowserWorker {
         chatGptExpiredSessionAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "session-expired" as const),
       ]);
       if (ready === "rate-limit") await throwIfChatGptRateLimitDialog(page);
-      if (ready === "session-expired") await throwIfChatGptSessionFailureAlert(page);
+      if (ready === "session-expired") throw chatGptSessionExpiredError();
       await captureDiagnostic?.("effort-slider-visible");
     } catch (error) {
       if (error instanceof ChatGptWebAdapterError) throw error;
