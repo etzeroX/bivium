@@ -4119,3 +4119,115 @@ describe("adapter liveness covers every path through a turn", () => {
     expect(heartbeats.at(-1)).toBeGreaterThanOrEqual(CHATGPT_WEB_ADAPTER_HEARTBEAT_MS);
   }, 40_000);
 });
+
+test("fresh structured compaction fallback remains safe with text-integrity diagnostics enabled", async () => {
+  const socketPath = brokerTestEndpoint(`cgw-diag-fallback-${process.pid}-${Date.now()}`);
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://chatgpt-diag-fallback-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "launcher",
+      browserHostDescriptorPath: join(tempRoot, "diag-fallback-launcher.json"),
+      brokerSocketPath: socketPath,
+      turnTimeoutMs: 30_000,
+      localToolsEnabled: true,
+      solAvailable: true,
+      extraHighAvailable: true,
+      proAvailable: true,
+    },
+  };
+
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  const originalDiagnostics = process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY;
+  const originalInfo = console.info;
+  const diagnosticLines: string[] = [];
+  let fallbackTraceId = "";
+
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    fallbackTraceId = turn.traceId;
+
+    expect(turn.traceId).toMatch(/^[a-f0-9]{12}_fallback$/);
+    expect(turn.compaction).toBeTrue();
+    expect(turn.capabilities.localToolsEnabled).toBeFalse();
+
+    const prepared = await turn.prepare();
+    try {
+      expect(prepared.text.length).toBeGreaterThan(0);
+      return "Fresh fallback checkpoint";
+    } finally {
+      prepared.release();
+    }
+  };
+
+  try {
+    process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY = "1";
+    console.info = (...values: unknown[]) => {
+      diagnosticLines.push(values.join(" "));
+    };
+
+    const compact = rawWireRequest(environmentXml);
+    compact._compactionRequest = true;
+
+    const raw = compact._rawBody as {
+      prompt_cache_key: string;
+      client_metadata: Record<string, unknown>;
+      input: Array<Record<string, unknown>>;
+    };
+
+    const threadId = `thread_diag_fallback_${Date.now()}`;
+    const sourceTurnId = "turn_diag_source_missing";
+    const compactionTurnId = "turn_diag_compaction";
+
+    raw.prompt_cache_key = threadId;
+    raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: threadId,
+      turn_id: compactionTurnId,
+    });
+
+    for (const item of raw.input) {
+      item.internal_chat_message_metadata_passthrough = {
+        turn_id: sourceTurnId,
+      };
+    }
+
+    const events: AdapterEvent[] = [];
+
+    await createChatGptWebAdapter(provider).runTurn!(
+      compact,
+      { headers: new Headers() },
+      event => events.push(event),
+    );
+
+    expect(fallbackTraceId).toMatch(/^[a-f0-9]{12}_fallback$/);
+
+    expect(diagnosticLines.some(line =>
+      line.includes("[chatgpt-web] text-integrity")
+      && line.includes(`"traceId":"${fallbackTraceId}"`)
+      && line.includes('"boundary":"compiled_prompt"')
+    )).toBeTrue();
+
+    expect(events.some(event =>
+      event.type === "text_delta"
+      && event.text.includes("Fresh fallback checkpoint")
+    )).toBeTrue();
+
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      stopReason: "stop",
+      endTurn: true,
+    });
+  } finally {
+    if (originalDiagnostics === undefined) {
+      delete process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY;
+    } else {
+      process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY = originalDiagnostics;
+    }
+
+    console.info = originalInfo;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+
+    chatGptTurnSessions.clear();
+    await TurnBroker.forSocket(socketPath).close();
+  }
+});

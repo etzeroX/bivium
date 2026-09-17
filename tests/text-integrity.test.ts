@@ -95,3 +95,99 @@ test("title and body markers survive Responses parsing and prompt compilation", 
   expect(parsedFingerprint.markers).toEqual(rawFingerprint.markers);
   expect(compiledFingerprint.markers).toEqual(rawFingerprint.markers);
 });
+
+test("text-integrity accepts the owned compaction fallback trace id without exposing prompt text", () => {
+  const originalInfo = console.info;
+  const originalDiagnostics = process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY;
+  const lines: string[] = [];
+  console.info = (...values: unknown[]) => { lines.push(values.join(" ")); };
+  try {
+    process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY = "1";
+
+    expect(() => reportChatGptTextIntegrity(
+      "abcdef123456_fallback",
+      "compiled_prompt",
+      [{
+        name: "body",
+        text: "BODY_BEGIN_fallback_probe private-fallback-sentinel",
+      }],
+    )).not.toThrow();
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('"traceId":"abcdef123456_fallback"');
+    expect(lines[0]).toContain('"kind":"BODY_BEGIN"');
+    expect(lines[0]).not.toContain("BODY_BEGIN_fallback_probe");
+    expect(lines[0]).not.toContain("private-fallback-sentinel");
+  } finally {
+    console.info = originalInfo;
+  }
+});
+
+test("text-integrity ignores untrusted trace ids instead of affecting production", () => {
+  const originalInfo = console.info;
+  const originalDiagnostics = process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY;
+  const lines: string[] = [];
+  console.info = (...values: unknown[]) => { lines.push(values.join(" ")); };
+  try {
+    process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY = "1";
+
+    expect(() => reportChatGptTextIntegrity(
+      "unsafe-trace-id-with-user-content",
+      "compiled_prompt",
+      [{
+        name: "body",
+        text: "BODY_BEGIN_untrusted secret-never-log",
+      }],
+    )).not.toThrow();
+
+    expect(lines).toEqual([]);
+  } finally {
+    console.info = originalInfo;
+  }
+});
+
+test("text-integrity ignores invalid boundaries instead of affecting production", () => {
+  const originalInfo = console.info;
+  const originalDiagnostics = process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY;
+  const lines: string[] = [];
+  console.info = (...values: unknown[]) => { lines.push(values.join(" ")); };
+  try {
+    process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY = "1";
+
+    expect(() => reportChatGptTextIntegrity(
+      "abcdef123456",
+      "compiled prompt unsafe",
+      [{
+        name: "body",
+        text: "BODY_BEGIN_boundary secret-never-log",
+      }],
+    )).not.toThrow();
+
+    expect(lines).toEqual([]);
+  } finally {
+    console.info = originalInfo;
+  }
+});
+
+test("text-integrity logger failures never affect production", () => {
+  const originalInfo = console.info;
+  const originalDiagnostics = process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY;
+  try {
+    process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY = "1";
+
+    console.info = () => {
+      throw new Error("simulated diagnostic logger failure");
+    };
+
+    expect(() => reportChatGptTextIntegrity(
+      "abcdef123456_fallback",
+      "compiled_prompt",
+      [{
+        name: "body",
+        text: "BODY_BEGIN_logger secret-never-log",
+      }],
+    )).not.toThrow();
+  } finally {
+    console.info = originalInfo;
+  }
+});
