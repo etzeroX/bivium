@@ -77,6 +77,10 @@ test("normal shutdown persists the ChatGPT session before closing browser views"
   );
   const persist = electronMain.indexOf("await browserHost?.persistSession()");
   const destroy = electronMain.indexOf("browserHost?.destroy()", persist);
+  const restoreRoute = electronMain.indexOf('runtimeHost?.restoreBridgeRoute("launcher-quit-route-restore")');
+  const stopRuntime = electronMain.indexOf("runtimeSupervisor?.shutdown", restoreRoute);
+  assert.ok(restoreRoute >= 0, "shutdown must restore the previous Codex route");
+  assert.ok(stopRuntime > restoreRoute, "the Codex route must be restored before the local runtime stops");
   assert.ok(persist >= 0, "shutdown must persist the ChatGPT session");
   assert.ok(destroy > persist, "browser views must close only after session persistence completes");
 });
