@@ -54,6 +54,20 @@ Do not hand-edit the launcher's route journal. It exists so setup and removal ca
 of silently destroying another provider's configuration. First-class external-router composition is
 tracked in [#205](https://github.com/miuuyy/codex-chatgpt-web/issues/205), but is not supported today.
 
+## Native models fail after the launcher or bridge stops
+
+Codex exposes `openai_base_url` as a provider-wide route, so while Bivium is connected both Web and
+Native requests first reach its local listener. Native requests are forwarded directly with Codex's
+own bearer authorization; they do not use the ChatGPT browser session, Temporary Chat, MCP connector,
+or tunnel runtime.
+
+A normal launcher exit restores the exact route that preceded Bivium before stopping the listener.
+If the launcher was killed, the machine lost power, or files were changed externally, start the
+launcher and let startup recovery run, or execute `codex-chatgpt-web route disconnect`. The command
+fails closed if it cannot prove route ownership. Restart Codex if the already-running Codex process
+has not reloaded the restored configuration. Never delete `.codex` or browser profile data to repair
+this condition.
+
 ## ChatGPT sign-in does not complete
 
 The launcher must own the ChatGPT session used for model turns. Signing in to an unrelated browser

@@ -62,6 +62,20 @@ export function chatGptStoppedThinkingError(): ChatGptWebAdapterError {
   );
 }
 
+export function chatGptMessageTooLongError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    "ChatGPT rejected the submitted message because it exceeded the product message limit. "
+    + "No automatic retry was attempted because the bridge cannot assume whether a task message was accepted. "
+    + "Disable Bigger Context before retrying a compaction task.",
+    {
+      status: 413,
+      errorType: "invalid_request_error",
+      code: "chatgpt_message_too_long",
+      retryable: false,
+    },
+  );
+}
+
 export function chatGptRetainedConversationUnavailableError(): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
     "The retained ChatGPT conversation is no longer available.",

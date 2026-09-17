@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import type { ProviderAdapter } from "../src/adapters/base";
 import { defaultConfig } from "../src/config";
 import { COMPACT_PROMPT, SUMMARY_PREFIX, decodeCompactionSummary, encodeCompactionSummary } from "../src/responses/compaction";
@@ -73,6 +73,30 @@ test("compacts ChatGPT Web v1 through a dedicated read-only browser summarizatio
     "Latest request",
     `${SUMMARY_PREFIX}\n${summary}`,
   ]);
+});
+
+test("parses a Web compact request body once before internal response dispatch", async () => {
+  const original = Request.prototype.arrayBuffer;
+  let reads = 0;
+  const arrayBuffer = spyOn(Request.prototype, "arrayBuffer").mockImplementation(function(this: Request) {
+    reads += 1;
+    return original.call(this);
+  });
+  try {
+    const response = await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Inspect" }] }],
+      }),
+    }), defaultConfig("full"), compactionAdapterFactory());
+
+    expect(response.status).toBe(200);
+    expect(reads).toBe(1);
+  } finally {
+    arrayBuffer.mockRestore();
+  }
 });
 
 test("compacts a Pro task with Pro effort", async () => {

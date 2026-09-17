@@ -81,6 +81,7 @@ import {
   ChatGptCompactionHandoffAccepted,
   ChatGptWebAdapterError,
   chatGptBrowserTabClosedError,
+  chatGptMessageTooLongError,
   chatGptRetainedConversationUnavailableError,
   chatGptStoppedThinkingError,
 } from "./adapter-error";
@@ -786,12 +787,26 @@ const chatGptExpiredSessionAlert = (page: Page): Locator => page
   .filter({ hasText: /Your session has expired|你的工作階段已過期|您的工作階段已過期|你的会话已过期|您的会话已过期/i })
   .last();
 
+const chatGptMessageTooLongAlert = (page: Page): Locator => page
+  .locator('[role="alert"], [role="dialog"]')
+  .filter({
+    hasText: /(?:message (?:you (?:sent|submitted)|is) (?:was |is )?too long|mensaje que (?:enviaste|has enviado)[\s\S]{0,80}demasiado largo|消息[\s\S]{0,40}(?:太长|過長)|訊息[\s\S]{0,40}(?:太長|過長)|メッセージ[\s\S]{0,40}長すぎ)/i,
+  })
+  .last();
+
+const chatGptSessionExpiredError = (): ChatGptWebAdapterError => new ChatGptWebAdapterError(
+  "The ChatGPT session has expired. Sign in again in Codex Web GPT.",
+  { status: 401, errorType: "authentication_error", code: "chatgpt_session_expired", retryable: false },
+);
+
 export async function throwIfChatGptSessionFailureAlert(page: Page): Promise<void> {
+  // Authentication state is page-authoritative. A stale turn-level product alert can coexist
+  // with the session dialog, but it must not downgrade an expired session into a payload error.
   if (await chatGptExpiredSessionAlert(page).isVisible().catch(() => false)) {
-    throw new ChatGptWebAdapterError(
-      "The ChatGPT session has expired. Sign in again in Codex Web GPT.",
-      { status: 401, errorType: "authentication_error", code: "chatgpt_session_expired", retryable: false },
-    );
+    throw chatGptSessionExpiredError();
+  }
+  if (await chatGptMessageTooLongAlert(page).isVisible().catch(() => false)) {
+    throw chatGptMessageTooLongError();
   }
   if (!await chatGptSubscriptionFailureAlert(page).isVisible().catch(() => false)) return;
   throw new ChatGptWebAdapterError(
@@ -1108,6 +1123,12 @@ export class ChatGptBrowserObservationTimeoutError extends Error {
   }
 }
 
+export function isChatGptObservationDisconnect(error: unknown): error is Error {
+  return error instanceof ChatGptBrowserObservationTimeoutError
+    || (error instanceof Error && !(error instanceof ChatGptWebAdapterError)
+      && /^(?:\w+(?:\.\w+)*: )?(?:Connection closed|Execution context was destroyed)(?:[.,]|$)/.test(error.message));
+}
+
 export async function withChatGptBrowserObservationTimeout<T>(
   operation: Promise<T>,
   timeoutMs = CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS,
@@ -1228,7 +1249,7 @@ interface ChatGptSubmissionObservationRecovery {
 
 type ChatGptObservationRecovery = (
   attempt: number,
-  cause: ChatGptBrowserObservationTimeoutError,
+  cause: Error,
   baseline: ChatGptSubmissionBaseline,
   abortSignal?: AbortSignal,
 ) => Promise<ChatGptSubmissionObservationRecovery>;
@@ -1297,13 +1318,14 @@ export function chatGptSubmissionEvidence(state: {
 
 export type ChatGptConnectorAttachmentMode = "none" | "mention" | "retained";
 
-/** A launcher lease may reuse a connector only after proving that exact retained surface is bound. */
+/** Retaining history never proves the connector selection in the current composer. */
 export function chatGptConnectorAttachmentMode(
   localTools: boolean,
-  reuseConversation: boolean,
+  _reuseConversation: boolean,
 ): ChatGptConnectorAttachmentMode {
   if (!localTools) return "none";
-  return reuseConversation ? "retained" : "mention";
+  // selectConnector checks the live pill first, selecting it only when it is absent.
+  return "mention";
 }
 
 export async function setChatGptThinkMode(
@@ -2402,7 +2424,7 @@ export class ChatGptBrowserWorker {
         currentEffort.waitFor({ state: "visible", timeout: 70_000, signal: effortWaitAbort.signal }).then(() => "effort" as const),
         chatGptExpiredSessionAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: effortWaitAbort.signal }).then(() => "session-expired" as const),
       ]);
-      if (ready === "session-expired") await throwIfChatGptSessionFailureAlert(page);
+      if (ready === "session-expired") throw chatGptSessionExpiredError();
     } catch (error) {
       if (error instanceof ChatGptWebAdapterError) throw error;
       await throwIfChatGptSessionFailureAlert(page);
@@ -2433,7 +2455,7 @@ export class ChatGptBrowserWorker {
         chatGptExpiredSessionAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "session-expired" as const),
       ]);
       if (ready === "rate-limit") await throwIfChatGptRateLimitDialog(page);
-      if (ready === "session-expired") await throwIfChatGptSessionFailureAlert(page);
+      if (ready === "session-expired") throw chatGptSessionExpiredError();
       await captureDiagnostic?.("effort-slider-visible");
     } catch (error) {
       if (error instanceof ChatGptWebAdapterError) throw error;
@@ -2521,7 +2543,10 @@ export class ChatGptBrowserWorker {
       );
       if (count === 1) return composers.first();
       await withBrowserTurnAbort(
-        new Promise(resolveSleep => setTimeout(resolveSleep, 50)),
+        this.waitForTurnDomMutation(
+          page,
+          Math.min(CHATGPT_UI_SETTLE_MS, Math.max(1, deadline - Date.now())),
+        ),
         abortSignal,
       );
     }
@@ -2943,6 +2968,43 @@ export class ChatGptBrowserWorker {
       locator: page.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
       acceptedTurnIdentities: state.turnIdentities,
     };
+  }
+
+  private async recoverBoundAssistantObservation(
+    conversationUrl: string,
+    baseline: ChatGptSubmissionBaseline,
+    binding: ChatGptAssistantTurnBinding,
+    attempt: number,
+    cause: Error,
+    recover: ChatGptObservationRecovery,
+    signal?: AbortSignal,
+  ): Promise<ChatGptSubmissionObservationRecovery & { binding: ChatGptAssistantTurnBinding }> {
+    throwIfPromptAttachmentAborted(signal);
+    if (attempt > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
+      throw new Error("ChatGPT browser observation exhausted its same-page rebind budget", { cause });
+    }
+    // The callback reconnects only the existing launcher surface/lease. Never acquire a new
+    // conversation or resend here, even if the old turn appears to have completed meanwhile.
+    const recovered = await recover(attempt, cause, baseline, signal);
+    throwIfPromptAttachmentAborted(signal);
+    if (recovered.page.url() !== conversationUrl) {
+      throw new Error("ChatGPT conversation changed during assistant observation recovery");
+    }
+    const state = await this.submissionDomState(recovered.page, recovered.baseline.domCache, signal);
+    const accepted = new Set(binding.acceptedTurnIdentities);
+    if (state.turnIdentities.length !== accepted.size
+      || new Set(state.turnIdentities).size !== accepted.size
+      || state.turnIdentities.some(identity => !accepted.has(identity))
+      || !state.responseIdentities.includes(binding.identity)) {
+      throw new Error("ChatGPT accepted turn identity changed during assistant observation recovery");
+    }
+    const locator = recovered.page.locator(`[data-turn-id=${JSON.stringify(binding.identity)}]`);
+    const count = await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(locator.count(), signal));
+    throwIfPromptAttachmentAborted(signal);
+    if (recovered.page.url() !== conversationUrl || count !== 1) {
+      throw new Error("ChatGPT assistant identity is ambiguous after observation recovery");
+    }
+    return { ...recovered, binding: { ...binding, locator } };
   }
 
   private async attachedPromptText(page: Page, abortSignal?: AbortSignal): Promise<string> {
@@ -4539,7 +4601,7 @@ export class ChatGptBrowserWorker {
       };
       const recoverPageObservation = async (
         attempt: number,
-        cause: ChatGptBrowserObservationTimeoutError,
+        cause: Error,
         baseline: ChatGptSubmissionBaseline,
         checkpoint: "submission-page-rebound" | "assistant-page-rebound",
         abortSignal?: AbortSignal,
@@ -4825,6 +4887,8 @@ export class ChatGptBrowserWorker {
       );
       await diagnostics.capture(page, "send-accepted");
 
+      const acceptedConversationUrl = page.url();
+
       let lastHeartbeat = 0;
       let finalText = "";
       let sawRunning = false;
@@ -4898,45 +4962,19 @@ export class ChatGptBrowserWorker {
 
         let snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
         if (!snapshot.responsePresent) {
-          try {
-            const rebound = await withChatGptBrowserObservationTimeout(
-              this.reconcileAssistantTurnBinding(
-                page,
-                submissionBaseline,
-                responseTurn,
-                turn.abortSignal,
-              ),
-            );
-            if (rebound.identity !== responseTurn.identity) {
-              responseTurn = rebound;
-              responseDomCache.key = undefined;
-              responseDomCache.snapshot = undefined;
-              snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
-            }
-          } catch (error) {
-            if (!(error instanceof ChatGptBrowserObservationTimeoutError) || !launcherSurfaceId) throw error;
-            consecutiveObservationRebinds += 1;
-            if (consecutiveObservationRebinds > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
-              throw new Error(
-                `ChatGPT browser DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`,
-                { cause: error },
-              );
-            }
-            await rebindLauncherPage(consecutiveObservationRebinds, error, turn.abortSignal);
-            submissionBaseline = {
-              ...submissionBaseline,
-              userTurns: page.locator(CHATGPT_USER_TURN_SELECTOR),
-              responseTurns: page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR),
-              domCache: {},
-            };
-            responseTurn = {
-              ...responseTurn,
-              locator: page.locator(`[data-turn-id=${JSON.stringify(responseTurn.identity)}]`),
-            };
+          const rebound = await withChatGptBrowserObservationTimeout(
+            this.reconcileAssistantTurnBinding(
+              page,
+              submissionBaseline,
+              responseTurn,
+              turn.abortSignal,
+            ),
+          );
+          if (rebound.identity !== responseTurn.identity) {
+            responseTurn = rebound;
             responseDomCache.key = undefined;
             responseDomCache.snapshot = undefined;
-            await diagnostics.capture(page, "response-page-rebound");
-            continue;
+            snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
           }
         }
         if (snapshot.stoppedThinkingVisible) throw chatGptStoppedThinkingError();
@@ -5079,6 +5117,22 @@ export class ChatGptBrowserWorker {
         }
         await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
        } catch (error) {
+        // A timeout in the primary response snapshot used to escape the narrower missing-node
+        // recovery above. Recover before any stream/tool side effects, retaining the Markdown
+        // buffer and completion tracker so previously emitted content cannot be emitted twice.
+        if (isChatGptObservationDisconnect(error)
+          && !observedThisIteration && launcherObservationRecovery) {
+          const recovered = await this.recoverBoundAssistantObservation(
+            acceptedConversationUrl, submissionBaseline, responseTurn,
+            ++consecutiveObservationRebinds, error, recoverAssistantObservation, turn.abortSignal,
+          );
+          submissionBaseline = recovered.baseline;
+          responseTurn = recovered.binding;
+          responseDomCache.key = undefined;
+          responseDomCache.snapshot = undefined;
+          completionFenceRevision = undefined;
+          continue;
+        }
         // Only a defect in this worker is retried here. Every deliberate signal — adapter errors,
         // aborts, closed tabs, DOM-health verdicts — still fails the turn immediately.
         // Retry only faults raised while reading the page. Once observation succeeded, a
