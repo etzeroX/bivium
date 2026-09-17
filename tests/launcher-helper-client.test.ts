@@ -547,7 +547,7 @@ test("a helper process death fails every pending turn and the next turn starts o
     headed: true,
     autoApproveToolCalls: false,
   });
-  const internal = client as unknown as { pending: Map<string, unknown> };
+  const internal = client as unknown as { child?: unknown; pending: Map<string, unknown> };
   const turn = (traceId: string): BrowserTurn => ({
     traceId,
     modelId: "gpt-5.6-sol",
@@ -562,12 +562,18 @@ test("a helper process death fails every pending turn and the next turn starts o
       client.run(turn("helper_crash_turn_b")),
     ]);
     expect(failed).toHaveLength(2);
+    const exitMessages: string[] = [];
     for (const result of failed) {
-      expect(result).toMatchObject({
-        status: "rejected",
-        reason: { message: expect.stringContaining("status 47") },
-      });
+      expect(result.status).toBe("rejected");
+      if (result.status !== "rejected") throw new Error("helper crash turn unexpectedly completed");
+      expect(result.reason).toBeInstanceOf(Error);
+      const message = (result.reason as Error).message;
+      expect(message).toContain("Launcher browser helper exited with status 47");
+      exitMessages.push(message);
     }
+    expect(exitMessages).toHaveLength(2);
+    expect(internal.child).toBeUndefined();
+    expect(Number(readFileSync(generationPath, "utf8"))).toBe(1);
     expect(internal.pending.size).toBe(0);
     await expect(client.run(turn("helper_restart_turn_c"))).resolves.toBe("fresh helper completed");
     expect(Number(readFileSync(generationPath, "utf8"))).toBe(2);
