@@ -207,6 +207,23 @@ when a task starts, and its global `multi_agent_v2` override wins over per-model
 protocol therefore requires restarting Codex and starting a new task. Model choice, effort,
 context, and service tiers are otherwise unchanged.
 
+`openai_base_url` is a provider-wide Codex setting, not a per-model catalog field. While the route
+is connected, Native Responses therefore enter the local daemon too, but immediately pass through
+to the official Codex backend with the incoming Codex bearer token. That path does not construct a
+browser adapter and does not require ChatGPT browser authentication, Temporary Chat, MCP, or the
+Full-mode tunnel; only the local Responses listener and, when applicable, the launcher's OS proxy
+resolver participate. Switching Web → Native → Web is consequently a request-routing decision and
+does not rewrite `.codex`, reinstall Codex, or restart Bivium.
+
+The lifecycle removes the unavoidable listener dependency at its ownership boundaries. Startup
+connects the journaled route only after the daemon is ready. Normal launcher exit restores the exact
+prior `openai_base_url` before stopping the daemon, and refuses to exit if that restoration cannot
+be proven. Disconnect and uninstall use the same journaled baseline. An external replacement with a
+different semantic URL fails closed, while a formatter-only rewrite of Bivium's same URL remains
+recognizable as owned. An ungraceful process kill or machine power loss cannot run this compensation;
+in that case `route disconnect` (or launcher startup recovery) restores the prior route, and Codex
+may need a restart if its running process has not reloaded the user config.
+
 The built-in provider attempts a Responses WebSocket prewarm. The local route explicitly returns
 HTTP `426`, which is Codex's native capability-negotiation signal for an immediate, session-sticky
 switch to its HTTP/SSE transport. No model or provider fallback occurs.
