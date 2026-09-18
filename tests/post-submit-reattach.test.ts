@@ -88,11 +88,16 @@ test.each([
     config: { appName: "Codex Native2", browserDiagnosticsPath: diagnostics, browserHostDescriptorPath: "fixture" },
     runStage: async (_trace: string, _stage: string, _timeout: number, action: (signal: AbortSignal) => Promise<unknown>) => action(new AbortController().signal),
     prepareTemporaryChatSurface: async () => {},
-    selectModelAndEffort: async () => resolveChatGptWebModelMode("gpt-5.6-sol", "high", capabilities),
+    selectModelAndEffort: async () => {
+      expect(bindings).toBe(localTools ? 1 : 0);
+      expect(attachments).toBe(0);
+      expect(sends).toBe(0);
+      return resolveChatGptWebModelMode("gpt-5.6-sol", "high", capabilities);
+    },
     captureSubmissionBaseline: async () => f.baseline,
     activeComposer: async () => composer,
     selectConnector: async () => { bindings++; return composer; },
-    insertPromptText: async () => { attachments++; if (localTools) expect(bindings).toBe(1); },
+    insertPromptText: async () => { attachments++; if (localTools) expect(bindings).toBe(2); },
     assertPromptAttached: async () => {},
     attachPromptWithCompactionRetry: async (page: never, text: string, tools: boolean) => {
       await ChatGptBrowserWorker.prototype["attachPrompt"].call(worker, page, text, tools,
@@ -130,7 +135,7 @@ test.each([
     expect(recoveries).toBe(1);
     expect(releases).toBe(1);
     expect(attachments).toBe(1);
-    expect(bindings).toBe(localTools ? 1 : 0);
+    expect(bindings).toBe(localTools ? 2 : 0);
     expect(freshPrepares).toBe(retained ? 0 : 1);
     expect(resumedPrepares).toBe(retained ? 1 : 0);
   } finally {

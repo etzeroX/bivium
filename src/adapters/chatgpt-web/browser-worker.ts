@@ -710,6 +710,9 @@ export async function ensureChatGptPersonalizedConnectorAccess(
     );
   } catch (error) {
     if (error instanceof ChatGptPersistentBrowserStateError) throw error;
+    // A completed connector proof failure is authoritative even when cleanup used the remaining
+    // preflight budget. Do not relabel unknown catalog readiness as a personalization failure.
+    if (error instanceof ChatGptWebAdapterError && error.code === "connector_not_found") throw error;
     if (!abortSignal?.aborted && (
       error instanceof ChatGptPersonalizationDeadlineError
       || deadlineController.signal.aborted
@@ -3171,10 +3174,69 @@ export class ChatGptBrowserWorker {
     });
   }
 
+  /** A missing row is indeterminate while the catalog hydrates, never a personalization proof.
+   * Keep the exact Playwright locator authoritative. Mutations wake the next probe; the short
+   * fallback covers a mutation between the locator read and observer registration.
+   */
+  private async waitForConnectorMenu(
+    page: Page,
+    appResult: Locator,
+    deadline: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    for (;;) {
+      throwIfPromptAttachmentAborted(signal);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw chatGptConnectorUnavailableError(
+          "ChatGPT connector catalog readiness deadline expired without proving the exact configured connector",
+        );
+      }
+      // isVisible is a snapshot, not a locator wait with a tiny timeout that could expire
+      // before a CDP round trip even when the row already exists.
+      if (await withBrowserTurnAbort(
+        withChatGptBrowserObservationTimeout(Promise.resolve().then(() => appResult.isVisible())), signal,
+      )) return;
+      const id = randomUUID();
+      try {
+        await withBrowserTurnAbort(withChatGptBrowserObservationTimeout(page.evaluate(({ id, timeout }) => new Promise<void>(resolve => {
+          const scope = globalThis as typeof globalThis & {
+            __CODEX_CONNECTOR_WAITERS__?: Map<string, () => void>;
+          };
+          const waiters = scope.__CODEX_CONNECTOR_WAITERS__ ??= new Map();
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            observer.disconnect();
+            clearTimeout(timer);
+            waiters.delete(id);
+            resolve();
+          };
+          const observer = new MutationObserver(finish);
+          const timer = setTimeout(finish, timeout);
+          waiters.set(id, finish);
+          observer.observe(document.documentElement, {
+            subtree: true, childList: true, characterData: true, attributes: true,
+          });
+        }), { id, timeout: Math.min(100, Math.max(1, deadline - Date.now())) })), signal);
+      } finally {
+        // AbortSignal cancels the host wait, not an in-page Promise. Explicitly dispose its
+        // observer/timer before returning, including cancellation between registration and read.
+        await withChatGptBrowserObservationTimeout(page.evaluate(id => {
+          const scope = globalThis as typeof globalThis & {
+            __CODEX_CONNECTOR_WAITERS__?: Map<string, () => void>;
+          };
+          scope.__CODEX_CONNECTOR_WAITERS__?.get(id)?.();
+        }, id));
+      }
+    }
+  }
+
   private async selectConnector(
     page: Page,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
-    catalogRefreshAvailable = false,
+    _catalogRefreshAvailable = false,
     attemptBudget: ChatGptConnectorAttemptBudget = { triggerAttempts: 0 },
     abortSignal?: AbortSignal,
   ): Promise<Locator> {
@@ -3183,6 +3245,7 @@ export class ChatGptBrowserWorker {
       await withBrowserTurnAbort(captureDiagnostic?.(checkpoint) ?? Promise.resolve(), abortSignal);
       throwIfPromptAttachmentAborted(abortSignal);
     };
+    const connectorDeadline = Date.now() + CHATGPT_PERSONALIZATION_PREFLIGHT_TIMEOUT_MS;
     let composer: Locator;
     const menuRows = page.locator('.__menu-item[tabindex="0"]');
     const appResult = menuRows.filter({
@@ -3212,11 +3275,11 @@ export class ChatGptBrowserWorker {
           });
           await capture("personalization-proof-mention-triggered");
           try {
-            await appResult.waitFor({ state: "visible", timeout: 2_500, signal: personalizationSignal });
+            await this.waitForConnectorMenu(page, appResult, connectorDeadline, personalizationSignal);
             proofResult = true;
             await capture("personalization-proof-menu-visible");
           } catch (error) {
-            if (!(error instanceof Error) || error.name !== "TimeoutError") throw error;
+            if (!(error instanceof ChatGptWebAdapterError) || error.code !== "connector_not_found") throw error;
             proofResult = false;
             await capture("personalization-proof-menu-missing");
             const mention = await composer.evaluate(element => ({
@@ -3229,6 +3292,7 @@ export class ChatGptBrowserWorker {
                 `ChatGPT did not preserve the connector mention (expectedChars=${CHATGPT_CONNECTOR_MENTION_QUERY.length}, actualChars=${mention.text.length}, focused=${mention.focused})`,
               );
             }
+            throw error; // Unknown catalog readiness is not evidence to toggle personalization.
           }
         } catch (error) {
           proofError = error;
@@ -3254,63 +3318,30 @@ export class ChatGptBrowserWorker {
       }
       await composer.fill("", { signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
 
-      let firstMenuCaptured = false;
-      while (attemptBudget.triggerAttempts < MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS) {
-        attemptBudget.triggerAttempts += 1;
-        composer = await this.activeComposer(page, 30_000, abortSignal);
-        await composer.fill("", { signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
-        await composer.focus({ signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
-        await withBrowserTurnAbort(settleChatGptUi(), abortSignal);
-        await composer.pressSequentially(CHATGPT_CONNECTOR_MENTION_QUERY, {
-          delay: 25,
-          signal: abortSignal,
-          timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
-        });
-        if (!firstMenuCaptured) {
-          firstMenuCaptured = true;
-          await capture("connector-mention-triggered");
-        }
-        try {
-          await appResult.waitFor({
-            state: "visible",
-            timeout: 2_500,
-            signal: abortSignal,
-          });
-          await capture("connector-menu-visible");
-          break;
-        } catch (error) {
-          if (!(error instanceof Error) || error.name !== "TimeoutError") throw error;
-          const visibleRows = await this.connectorMentionRowTitles(menuRows, abortSignal);
-          const knownIdentityMismatch = this.config.appName === CHATGPT_CONNECTOR_NAME
-            && (
-              visibleRows.includes(DEV_CHATGPT_CONNECTOR_NAME)
-              || LEGACY_CHATGPT_CONNECTOR_NAMES.some(name => visibleRows.includes(name))
-            );
-          if (knownIdentityMismatch) {
-            await capture("connector-menu-missing");
-            throw chatGptConnectorUnavailableError(
-              await this.connectorMentionFailure(menuRows, attemptBudget.triggerAttempts, abortSignal),
-            );
-          }
-          if (
-            catalogRefreshAvailable
-            && visibleRows.length > 0
-            && !visibleRows.includes(this.config.appName)
-            && attemptBudget.triggerAttempts < MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS
-          ) {
-            throw new ChatGptConnectorCatalogStaleError(
-              this.config.appName,
-              attemptBudget.triggerAttempts,
-            );
-          }
-          if (attemptBudget.triggerAttempts >= MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS) {
-            await capture("connector-menu-missing");
-            throw chatGptConnectorUnavailableError(
-              await this.connectorMentionFailure(menuRows, attemptBudget.triggerAttempts, abortSignal),
-            );
-          }
-        }
+      if (attemptBudget.triggerAttempts >= MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS) {
+        throw chatGptConnectorUnavailableError("ChatGPT connector mention attempt budget exhausted");
       }
+      attemptBudget.triggerAttempts += 1;
+      composer = await this.activeComposer(page, 30_000, abortSignal);
+      await composer.fill("", { signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
+      await composer.focus({ signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
+      await withBrowserTurnAbort(settleChatGptUi(), abortSignal);
+      await composer.pressSequentially(CHATGPT_CONNECTOR_MENTION_QUERY, {
+        delay: 25, signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
+      });
+      await capture("connector-mention-triggered");
+      try {
+        await this.waitForConnectorMenu(page, appResult, connectorDeadline, abortSignal);
+      } catch (error) {
+        if (error instanceof ChatGptWebAdapterError && error.code === "connector_not_found") {
+          await capture("connector-menu-missing");
+          throw chatGptConnectorUnavailableError(
+            `${error.message}; ${await this.connectorMentionFailure(menuRows, attemptBudget.triggerAttempts, abortSignal)}`,
+          );
+        }
+        throw error;
+      }
+      await capture("connector-menu-visible");
       const exactResultCount = await withBrowserTurnAbort(
         withChatGptBrowserObservationTimeout(appResult.count()),
         abortSignal,
@@ -4695,8 +4726,27 @@ export class ChatGptBrowserWorker {
           ),
         );
       }
-      // A retained lease proves the connector binding, not the current model selection.
-      // Reconcile the live control before every submission, including retained continuations.
+      const connectorAttemptBudget: ChatGptConnectorAttemptBudget = { triggerAttempts: 0 };
+      // A retained lease is not proof that the current composer still has its connector. Resolve
+      // readiness before model/effort work, then re-prove the current pill during attachment.
+      // Multipart staging is browser-only and performs its connector proof on the final message.
+      if (requestedMode.localTools && !multipartStages) {
+        await this.runStage(
+          turn.traceId,
+          "connector_readiness",
+          CHATGPT_PERSONALIZATION_PREFLIGHT_TIMEOUT_MS,
+          stageSignal => this.selectConnector(
+            page,
+            checkpoint => diagnostics.capture(page, checkpoint),
+            false,
+            connectorAttemptBudget,
+            turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
+          ),
+          chatGptSuspensionClock,
+          true,
+        );
+      }
+      // Reconcile the live model control before every submission, including continuations.
       let mode = await this.runStage(turn.traceId, "effort_selection", browserStageTimeouts.effortSelection, () => (
         this.selectModelAndEffort(
           page,
@@ -4813,7 +4863,6 @@ export class ChatGptBrowserWorker {
 
       let submissionBaseline = await this.captureSubmissionBaseline(page);
       let catalogRefreshAvailable = mode.localTools && !reuseConversation && !prepared.multipart;
-      const connectorAttemptBudget: ChatGptConnectorAttemptBudget = { triggerAttempts: 0 };
       for (;;) {
         try {
           await this.runStage(
