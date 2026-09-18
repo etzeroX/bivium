@@ -43,6 +43,135 @@ interface ToolWaiter {
 
 export type SafeTurnState = "awaiting_start" | "running" | "completed" | "revoked";
 
+/**
+ * A serialization-free view of the broker state used to enforce lifecycle ownership at each
+ * stable transition. Keeping this independent of sockets also makes concurrency regressions
+ * deterministic to test.
+ */
+export interface TurnBrokerInvariantSnapshot {
+  ownership: "pending" | "bound";
+  pendingRegistered: boolean;
+  bindingRegistered: boolean;
+  queuedCallIds: readonly string[];
+  deliveredCallIds: readonly string[];
+  invocationCallIds: readonly string[];
+  activities: readonly string[];
+  completedActivities: readonly string[];
+  activityRevision: number;
+  compactionRequested: boolean;
+  hasCompactionResult: boolean;
+  completionCommitted: boolean;
+  completionRevision?: number;
+  safe?: {
+    state: SafeTurnState;
+    launcherSent: boolean;
+    connectorStarted: boolean;
+    hasFinalAnswer: boolean;
+  };
+}
+
+function uniqueIds(values: readonly string[], label: string): Set<string> {
+  const unique = new Set(values);
+  if (unique.size !== values.length) throw new Error(`TurnBroker invariant violated: duplicate ${label}`);
+  return unique;
+}
+
+/** Fail closed if an observable TurnBroker state cannot be produced by a valid transition. */
+export function assertTurnBrokerInvariant(snapshot: TurnBrokerInvariantSnapshot): void {
+  if (snapshot.ownership === "pending") {
+    if (!snapshot.pendingRegistered) {
+      throw new Error("TurnBroker invariant violated: pending channel is not registered as pending");
+    }
+    if (snapshot.bindingRegistered) {
+      throw new Error("TurnBroker invariant violated: pending channel is registered as bound");
+    }
+  } else {
+    if (snapshot.pendingRegistered) {
+      throw new Error("TurnBroker invariant violated: bound channel remains registered as pending");
+    }
+    if (!snapshot.bindingRegistered) {
+      throw new Error("TurnBroker invariant violated: bound channel has no registered binding");
+    }
+  }
+
+  const queued = uniqueIds(snapshot.queuedCallIds, "queued call id");
+  const delivered = uniqueIds(snapshot.deliveredCallIds, "delivered call id");
+  const invocations = uniqueIds(snapshot.invocationCallIds, "invocation call id");
+  for (const callId of queued) {
+    if (delivered.has(callId)) {
+      throw new Error(`TurnBroker invariant violated: call ${callId} is both queued and delivered`);
+    }
+    if (!invocations.has(callId)) {
+      throw new Error(`TurnBroker invariant violated: queued call has no pending invocation: ${callId}`);
+    }
+  }
+  for (const callId of delivered) {
+    if (!invocations.has(callId)) {
+      throw new Error(`TurnBroker invariant violated: delivered call has no pending invocation: ${callId}`);
+    }
+  }
+  for (const callId of invocations) {
+    if (!queued.has(callId) && !delivered.has(callId)) {
+      throw new Error(`TurnBroker invariant violated: invocation has no queued or delivered owner: ${callId}`);
+    }
+  }
+
+  const activities = uniqueIds(snapshot.activities, "active activity id");
+  const completedActivities = uniqueIds(snapshot.completedActivities, "completed activity id");
+  for (const activityId of activities) {
+    if (completedActivities.has(activityId)) {
+      throw new Error(`TurnBroker invariant violated: activity ${activityId} is both active and completed`);
+    }
+  }
+  if (!Number.isSafeInteger(snapshot.activityRevision)
+    || snapshot.activityRevision < activities.size + completedActivities.size) {
+    throw new Error("TurnBroker invariant violated: activity revision trails known activity transitions");
+  }
+
+  if (snapshot.compactionRequested !== snapshot.hasCompactionResult) {
+    throw new Error(snapshot.compactionRequested
+      ? "TurnBroker invariant violated: compaction request has no control result"
+      : "TurnBroker invariant violated: compaction result exists before compaction");
+  }
+  if (snapshot.compactionRequested && queued.size > 0) {
+    throw new Error("TurnBroker invariant violated: compaction retains queued calls");
+  }
+
+  if (snapshot.completionCommitted) {
+    if (snapshot.completionRevision !== snapshot.activityRevision) {
+      throw new Error("TurnBroker invariant violated: completion revision changed after commit");
+    }
+    if (activities.size > 0 || invocations.size > 0 || queued.size > 0 || delivered.size > 0) {
+      throw new Error("TurnBroker invariant violated: committed completion has live work");
+    }
+  } else if (snapshot.completionRevision !== undefined) {
+    throw new Error("TurnBroker invariant violated: uncommitted turn has a completion revision");
+  }
+
+  const safe = snapshot.safe;
+  if (!safe) return;
+  if (safe.state === "revoked") {
+    throw new Error("TurnBroker invariant violated: revoked Zero Risk turn remains registered");
+  }
+  if (safe.state === "awaiting_start" && safe.launcherSent && safe.connectorStarted) {
+    throw new Error("TurnBroker invariant violated: awaiting Zero Risk turn is fully authorized");
+  }
+  if ((safe.state === "running" || safe.state === "completed")
+    && (!safe.launcherSent || !safe.connectorStarted)) {
+    throw new Error("TurnBroker invariant violated: active Zero Risk turn lacks authorization");
+  }
+  if (safe.state === "completed") {
+    if (!safe.hasFinalAnswer) {
+      throw new Error("TurnBroker invariant violated: completed Zero Risk turn has no final answer");
+    }
+    if (activities.size > 0 || invocations.size > 0) {
+      throw new Error("TurnBroker invariant violated: completed Zero Risk turn has live work");
+    }
+  } else if (safe.hasFinalAnswer) {
+    throw new Error("TurnBroker invariant violated: non-completed Zero Risk turn has a final answer");
+  }
+}
+
 interface SafeWaiter<T> {
   resolve: (value: T) => void;
   reject: (error: Error) => void;
@@ -310,6 +439,7 @@ export class TurnBroker implements TurnBrokerOwner {
     };
     this.channels.set(token, channel);
     this.pending.set(token, channel);
+    this.assertChannelInvariant(token, channel);
     console.info(`[chatgpt-web] broker trace=${traceId} registered tokenHash=${handleFingerprint(token)}`);
     return token;
   }
@@ -334,6 +464,7 @@ export class TurnBroker implements TurnBrokerOwner {
       startWaiters: new Set(),
       completionWaiters: new Set(),
     };
+    this.assertChannelInvariant(token, channel);
     return token;
   }
 
@@ -380,6 +511,7 @@ export class TurnBroker implements TurnBrokerOwner {
     this.prune();
     let channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.assertChannelInvariant(token, channel);
     if (channel.safe?.state === "awaiting_start") {
       // The outer Codex adapter owns this wait. It crosses the start boundary only after the user
       // confirms in the Launcher that the copied prompt was sent in the visible ChatGPT tab.
@@ -387,6 +519,7 @@ export class TurnBroker implements TurnBrokerOwner {
       this.prune();
       channel = this.channels.get(token);
       if (!channel) throw new Error("turn token is invalid or expired");
+      this.assertChannelInvariant(token, channel);
     }
     // This owner-only empty batch tells the adapter to consume the already accepted completion.
     // Public Zero Risk MCP calls remain fail-closed after the turn reaches its terminal state.
@@ -402,7 +535,7 @@ export class TurnBroker implements TurnBrokerOwner {
       .map(id => channel.invocations.get(id)?.request)
       .filter((request): request is BrokerToolRequest => Boolean(request));
     if (delivered.length > 0) return delivered;
-    const ready = this.takeQueued(channel);
+    const ready = this.takeQueued(token, channel);
     if (ready.length > 0) return ready;
     if (signal?.aborted) throw new DOMException("tool wait aborted", "AbortError");
     return new Promise<BrokerToolRequest[]>((resolveWait, rejectWait) => {
@@ -429,6 +562,7 @@ export class TurnBroker implements TurnBrokerOwner {
       throw new Error(`tool call was completed before it was delivered: ${callId}`);
     }
     channel.invocations.delete(callId);
+    this.assertChannelInvariant(token, channel);
     console.info(`[chatgpt-web] broker trace=${channel.traceId} completed call=${callId.slice(0, 17)} pending=${channel.invocations.size}`);
     invocation.resolve(result);
   }
@@ -437,6 +571,7 @@ export class TurnBroker implements TurnBrokerOwner {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.assertChannelInvariant(token, channel);
     if (channel.completionCommitted) return channel.completionRevision;
     if (channel.activities.size > 0 || channel.invocations.size > 0) return undefined;
     return channel.activityRevision;
@@ -455,6 +590,7 @@ export class TurnBroker implements TurnBrokerOwner {
       || channel.invocations.size > 0) return false;
     channel.completionCommitted = true;
     channel.completionRevision = revision;
+    this.assertChannelInvariant(token, channel);
     console.info(
       `[chatgpt-web] broker trace=${channel.traceId} committed browser completion revision=${revision}`,
     );
@@ -490,6 +626,7 @@ export class TurnBroker implements TurnBrokerOwner {
       channel.compactionDeliveryCount += 1;
       invocation.resolve(structuredClone(queuedResult));
     }
+    this.assertChannelInvariant(token, channel);
     if (queued.length > 0) {
       console.info(
         `[chatgpt-web] broker trace=${channel.traceId} interrupted queued calls=${queued.length} for context compaction`,
@@ -501,6 +638,7 @@ export class TurnBroker implements TurnBrokerOwner {
   compactionDeliveryCount(token: string): number {
     const channel = this.channels.get(token);
     if (!channel) throw new Error("Cannot read compaction delivery after the turn capability retired");
+    this.assertChannelInvariant(token, channel);
     return channel.compactionDeliveryCount;
   }
 
@@ -516,6 +654,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (safe.connectorStarted) return { started: true, duplicate: true };
     safe.connectorStarted = true;
     this.activateSafeTurn(channel, safe);
+    this.assertChannelInvariant(requestId, channel);
     return { started: true, duplicate: false };
   }
 
@@ -534,6 +673,7 @@ export class TurnBroker implements TurnBrokerOwner {
     safe.launcherSent = true;
     this.resolveSafeWaiters(safe.sentWaiters, undefined);
     this.activateSafeTurn(channel, safe);
+    this.assertChannelInvariant(requestId, channel);
     return { confirmed: true, duplicate: false };
   }
 
@@ -565,6 +705,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     safe.state = "completed";
     safe.finalAnswer = finalAnswer;
+    this.assertChannelInvariant(requestId, channel);
     this.resolveSafeWaiters(safe.completionWaiters, finalAnswer);
     return { completed: true, duplicate: false };
   }
@@ -645,6 +786,37 @@ export class TurnBroker implements TurnBrokerOwner {
 
   setExternalOwnersAccepted(accepted: boolean): void {
     this.acceptingExternalOwners = accepted;
+  }
+
+  private assertChannelInvariant(token: string, channel: TurnChannel): void {
+    const binding = channel.bindingId ? this.bindings.get(channel.bindingId) : undefined;
+    assertTurnBrokerInvariant({
+      ownership: channel.bindingId ? "bound" : "pending",
+      pendingRegistered: this.pending.get(token) === channel,
+      bindingRegistered: binding?.token === token && binding.channel === channel,
+      queuedCallIds: channel.queuedCallIds,
+      deliveredCallIds: [...channel.deliveredCallIds],
+      invocationCallIds: [...channel.invocations.keys()],
+      activities: [...channel.activities],
+      completedActivities: [...channel.completedActivities],
+      activityRevision: channel.activityRevision,
+      compactionRequested: channel.compactionRequested,
+      hasCompactionResult: channel.compactionResult !== undefined,
+      completionCommitted: channel.completionCommitted,
+      ...(channel.completionRevision !== undefined
+        ? { completionRevision: channel.completionRevision }
+        : {}),
+      ...(channel.safe
+        ? {
+            safe: {
+              state: channel.safe.state,
+              launcherSent: channel.safe.launcherSent,
+              connectorStarted: channel.safe.connectorStarted,
+              hasFinalAnswer: channel.safe.finalAnswer !== undefined,
+            },
+          }
+        : {}),
+    });
   }
 
   private retire(history: Map<string, string>, handle: string, traceId: string): void {
@@ -1050,12 +1222,14 @@ export class TurnBroker implements TurnBrokerOwner {
         if (!existing || existing.token !== token || existing.channel !== activeChannel) {
           throw new Error("turn token binding state is inconsistent");
         }
+        this.assertChannelInvariant(token, activeChannel);
         return { bindingId: activeChannel.bindingId, activityId, environment: activeChannel.environment };
       }
       this.pending.delete(token);
       const bindingId = opaqueId("binding");
       activeChannel.bindingId = bindingId;
       this.bindings.set(bindingId, { token, channel: activeChannel });
+      this.assertChannelInvariant(token, activeChannel);
       return { bindingId, activityId, environment: activeChannel.environment };
     }
 
@@ -1070,6 +1244,9 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!channel) {
         return { completed: false, retired: this.retiredTokens.has(token) };
       }
+      if (channel.completionCommitted || channel.safe?.state === "completed") {
+        return { completed: false, retired: true };
+      }
       if (channel.completedActivities.has(request.activityId)) {
         return { completed: false, duplicate: true };
       }
@@ -1078,6 +1255,7 @@ export class TurnBroker implements TurnBrokerOwner {
       // A cleanup that overtakes an ambiguously delivered claim is still a causal event. Its
       // tombstone makes the delayed claim fail instead of resurrecting activity after a fence.
       channel.activityRevision += 1;
+      this.assertChannelInvariant(token, channel);
       return { completed: wasActive };
     }
 
@@ -1124,33 +1302,35 @@ export class TurnBroker implements TurnBrokerOwner {
     return new Promise<BrokerToolResult>((resolveInvoke, rejectInvoke) => {
       binding.channel.invocations.set(callId, { request: toolRequest, resolve: resolveInvoke, reject: rejectInvoke });
       binding.channel.queuedCallIds.push(callId);
+      this.assertChannelInvariant(binding.token, binding.channel);
       console.info(
         `[chatgpt-web] broker trace=${binding.channel.traceId} queued call=${callId.slice(0, 17)} tool=${wireName} waiters=${binding.channel.waiters.size}`,
       );
-      this.scheduleToolWaiters(binding.channel);
+      this.scheduleToolWaiters(binding.token, binding.channel);
     });
   }
 
-  private takeQueued(channel: TurnChannel): BrokerToolRequest[] {
+  private takeQueued(token: string, channel: TurnChannel): BrokerToolRequest[] {
     const ids = channel.queuedCallIds.splice(0);
     for (const id of ids) {
       if (channel.invocations.has(id)) channel.deliveredCallIds.add(id);
     }
+    this.assertChannelInvariant(token, channel);
     return ids.map(id => channel.invocations.get(id)?.request).filter((request): request is BrokerToolRequest => Boolean(request));
   }
 
-  private scheduleToolWaiters(channel: TurnChannel): void {
+  private scheduleToolWaiters(token: string, channel: TurnChannel): void {
     if (channel.queuedCallIds.length === 0 || channel.waiters.size === 0) return;
     if (channel.batchTimer) return;
     channel.batchTimer = setTimeout(() => {
       channel.batchTimer = undefined;
-      this.wakeToolWaiters(channel);
+      this.wakeToolWaiters(token, channel);
     }, 15);
   }
 
-  private wakeToolWaiters(channel: TurnChannel): void {
+  private wakeToolWaiters(token: string, channel: TurnChannel): void {
     if (channel.queuedCallIds.length === 0 || channel.waiters.size === 0) return;
-    const batch = this.takeQueued(channel);
+    const batch = this.takeQueued(token, channel);
     console.info(
       `[chatgpt-web] broker trace=${channel.traceId} delivered calls=${batch.length} tools=${batch.map(request => request.wireName).join(",")}`,
     );

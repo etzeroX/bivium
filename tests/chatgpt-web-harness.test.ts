@@ -2091,6 +2091,12 @@ describe("ChatGPT outer-native harness v4", () => {
     const finalRevision = broker.beginCompletionFence(token);
     expect(finalRevision).toBe(4);
     expect(broker.commitCompletionFence(token, finalRevision!)).toBeTrue();
+    expect(await callTurnBroker<{ completed: boolean; retired: boolean }>(socketPath, {
+      method: "activity_complete",
+      token,
+      activityId: "activity_cleanup_after_commit_01",
+    })).toEqual({ completed: false, retired: true });
+    expect(broker.beginCompletionFence(token)).toBe(finalRevision);
     await expect(callTurnBroker(socketPath, { method: "claim", token }))
       .rejects.toThrow("has already finished");
     await broker.close();
@@ -2454,6 +2460,197 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(replayEvents).toEqual(secondEvents);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("continues the same Full task after retained compaction without replaying a prompt", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-d-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-compaction-resume-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "compaction-resume-launcher.json"),
+        brokerSocketPath: socketPath,
+        turnTimeoutMs: 30_000,
+        localToolsEnabled: true,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    const namespace = chatGptWebExecutionNamespace(provider);
+    const checkpoint = "Repository state retained for the exact pending task.";
+    let browserSubmissions = 0;
+    let retainedHandoffs = 0;
+    let continuationToolCalls = 0;
+    let continuationConversationKey = "";
+
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserSubmissions += 1;
+      if (turn.requireRetainedConversation) {
+        retainedHandoffs += 1;
+        const prepared = await turn.prepareResume!();
+        try {
+          const controlToken = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
+          const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
+          if (!controlToken || !handoffId) throw new Error("structured compaction binding missing");
+          await callTurnBroker(socketPath, {
+            method: "submit_compaction_handoff",
+            token: controlToken,
+            handoffId,
+            summary: checkpoint,
+          });
+          return "Checkpoint accepted";
+        } finally {
+          prepared.release();
+        }
+      }
+
+      const prepared = await turn.prepare();
+      try {
+        if (!prepared.text.includes("Continue the exact task after compaction")) {
+          turn.onTextDelta("Original task reached the compaction threshold");
+          return "Original task reached the compaction threshold";
+        }
+        expect(turn.capabilities.localToolsEnabled).toBeTrue();
+        expect(turn.nativeConnector).not.toBeFalse();
+        continuationConversationKey = turn.conversationKey ?? "";
+        const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+        if (!token) throw new Error("continued Full turn token missing");
+        const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, {
+          method: "claim",
+          token,
+        });
+        continuationToolCalls += 1;
+        const nativeResult = await invokeAfterBrowserBoundary(turn, () => callTurnBroker<BrokerToolResult>(socketPath, {
+          method: "invoke",
+          bindingId: claimed.bindingId,
+          wireName: "exec_command",
+          freeform: false,
+          arguments: { cmd: "git status --short", workdir: tempRoot },
+        }));
+        const output = (nativeResult.structuredContent as { output: string }).output;
+        const answer = `Continued exact task: ${output}`;
+        turn.onTextDelta(answer);
+        return answer;
+      } finally {
+        prepared.release();
+      }
+    };
+
+    const adapter = createChatGptWebAdapter(provider);
+    const source = rawWireRequest(environmentXml);
+    const sourceConversationKey = chatGptConversationKey(source, namespace)!;
+    try {
+      const sourceEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(source, { headers: new Headers() }, event => sourceEvents.push(event));
+      expect(sourceEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      const sourceExecutionKey = `${namespace}:${chatGptTurnExecutionKey(source)}`;
+      const sourceSession = chatGptTurnSessions.find(sourceExecutionKey);
+      if (!sourceSession) throw new Error("completed compaction source missing");
+      sourceSession.runtime.releaseRetainedConversation = async () => {};
+
+      const compact = structuredClone(source);
+      compact._compactionRequest = true;
+      (compact._rawBody as { client_metadata: Record<string, unknown> }).client_metadata = {
+        "x-codex-turn-metadata": JSON.stringify({
+          thread_id: "thread_test_123",
+          turn_id: "turn_compaction_resume",
+        }),
+      };
+      const compactEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(compact, { headers: new Headers() }, event => compactEvents.push(event));
+      expect(compactEvents.some(event => event.type === "text_delta" && event.text.includes(checkpoint))).toBeTrue();
+      expect(compactEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(retainedHandoffs).toBe(1);
+
+      const continuation = rawWireRequest(environmentXml);
+      continuation.context.messages = [
+        { role: "user", content: `${SUMMARY_PREFIX}\n${checkpoint}`, timestamp: 3 },
+        { role: "user", content: "Continue the exact task after compaction", timestamp: 4 },
+      ];
+      const continuationBody = continuation._rawBody as {
+        client_metadata: Record<string, unknown>;
+        input: Array<Record<string, unknown>>;
+      };
+      continuationBody.client_metadata = {
+        "x-codex-turn-metadata": JSON.stringify({
+          thread_id: "thread_test_123",
+          turn_id: "turn_after_compaction",
+        }),
+      };
+      continuationBody.input.unshift({
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${checkpoint}` }],
+      });
+      const current = continuationBody.input.at(-1)!;
+      current.content = [{ type: "input_text", text: "Continue the exact task after compaction" }];
+      current.internal_chat_message_metadata_passthrough = { turn_id: "turn_after_compaction" };
+      continuationBody.input[1]!.internal_chat_message_metadata_passthrough = { turn_id: "turn_after_compaction" };
+
+      expect(chatGptThreadOwnershipKey(continuation)).toBe(chatGptThreadOwnershipKey(source));
+      expect(chatGptConversationKey(continuation, namespace)).not.toBe(sourceConversationKey);
+
+      const toolEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(continuation, { headers: new Headers() }, event => toolEvents.push(event));
+      const call = toolEvents.find(
+        (event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start",
+      );
+      expect(call?.name).toBe("exec_command");
+      expect(toolEvents.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
+
+      const completed = structuredClone(continuation);
+      const toolCall = {
+        role: "assistant" as const,
+        content: [{
+          type: "toolCall" as const,
+          id: call!.id,
+          name: "exec_command",
+          arguments: { cmd: "git status --short", workdir: tempRoot },
+        }],
+        timestamp: 5,
+      };
+      const result = {
+        role: "toolResult" as const,
+        toolCallId: call!.id,
+        toolName: "exec_command",
+        content: JSON.stringify({ output: "clean", exit_code: 0 }),
+        isError: false,
+        timestamp: 6,
+      };
+      completed.context.messages.push(toolCall, result);
+      ((completed._rawBody as { input: unknown[] }).input).push(
+        {
+          type: "function_call",
+          call_id: call!.id,
+          name: "exec_command",
+          arguments: JSON.stringify({ cmd: "git status --short", workdir: tempRoot }),
+        },
+        { type: "function_call_output", call_id: call!.id, output: result.content },
+      );
+      const finalEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(completed, { headers: new Headers() }, event => finalEvents.push(event));
+      expect(finalEvents.some(event => event.type === "text_delta"
+        && event.text.includes("Continued exact task: clean"))).toBeTrue();
+      expect(finalEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(continuationConversationKey).not.toBe("");
+      expect(continuationConversationKey).not.toBe(sourceConversationKey);
+      expect(continuationToolCalls).toBe(1);
+      expect(browserSubmissions).toBe(3);
+
+      const replayEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(completed, { headers: new Headers() }, event => replayEvents.push(event));
+      expect(replayEvents).toEqual(finalEvents);
+      expect(continuationToolCalls).toBe(1);
+      expect(browserSubmissions).toBe(3);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      chatGptTurnSessions.clear();
       await TurnBroker.forSocket(socketPath).close();
     }
   });
@@ -3921,4 +4118,116 @@ describe("adapter liveness covers every path through a turn", () => {
     expect(heartbeats.length).toBeGreaterThanOrEqual(2);
     expect(heartbeats.at(-1)).toBeGreaterThanOrEqual(CHATGPT_WEB_ADAPTER_HEARTBEAT_MS);
   }, 40_000);
+});
+
+test("fresh structured compaction fallback remains safe with text-integrity diagnostics enabled", async () => {
+  const socketPath = brokerTestEndpoint(`cgw-diag-fallback-${process.pid}-${Date.now()}`);
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://chatgpt-diag-fallback-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "launcher",
+      browserHostDescriptorPath: join(tempRoot, "diag-fallback-launcher.json"),
+      brokerSocketPath: socketPath,
+      turnTimeoutMs: 30_000,
+      localToolsEnabled: true,
+      solAvailable: true,
+      extraHighAvailable: true,
+      proAvailable: true,
+    },
+  };
+
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  const originalDiagnostics = process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY;
+  const originalInfo = console.info;
+  const diagnosticLines: string[] = [];
+  let fallbackTraceId = "";
+
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    fallbackTraceId = turn.traceId;
+
+    expect(turn.traceId).toMatch(/^[a-f0-9]{12}_fallback$/);
+    expect(turn.compaction).toBeTrue();
+    expect(turn.capabilities.localToolsEnabled).toBeFalse();
+
+    const prepared = await turn.prepare();
+    try {
+      expect(prepared.text.length).toBeGreaterThan(0);
+      return "Fresh fallback checkpoint";
+    } finally {
+      prepared.release();
+    }
+  };
+
+  try {
+    process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY = "1";
+    console.info = (...values: unknown[]) => {
+      diagnosticLines.push(values.join(" "));
+    };
+
+    const compact = rawWireRequest(environmentXml);
+    compact._compactionRequest = true;
+
+    const raw = compact._rawBody as {
+      prompt_cache_key: string;
+      client_metadata: Record<string, unknown>;
+      input: Array<Record<string, unknown>>;
+    };
+
+    const threadId = `thread_diag_fallback_${Date.now()}`;
+    const sourceTurnId = "turn_diag_source_missing";
+    const compactionTurnId = "turn_diag_compaction";
+
+    raw.prompt_cache_key = threadId;
+    raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: threadId,
+      turn_id: compactionTurnId,
+    });
+
+    for (const item of raw.input) {
+      item.internal_chat_message_metadata_passthrough = {
+        turn_id: sourceTurnId,
+      };
+    }
+
+    const events: AdapterEvent[] = [];
+
+    await createChatGptWebAdapter(provider).runTurn!(
+      compact,
+      { headers: new Headers() },
+      event => events.push(event),
+    );
+
+    expect(fallbackTraceId).toMatch(/^[a-f0-9]{12}_fallback$/);
+
+    expect(diagnosticLines.some(line =>
+      line.includes("[chatgpt-web] text-integrity")
+      && line.includes(`"traceId":"${fallbackTraceId}"`)
+      && line.includes('"boundary":"compiled_prompt"')
+    )).toBeTrue();
+
+    expect(events.some(event =>
+      event.type === "text_delta"
+      && event.text.includes("Fresh fallback checkpoint")
+    )).toBeTrue();
+
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      stopReason: "stop",
+      endTurn: true,
+    });
+  } finally {
+    if (originalDiagnostics === undefined) {
+      delete process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY;
+    } else {
+      process.env.CODEX_CHATGPT_WEB_TEXT_INTEGRITY = originalDiagnostics;
+    }
+
+    console.info = originalInfo;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+
+    chatGptTurnSessions.clear();
+    await TurnBroker.forSocket(socketPath).close();
+  }
 });

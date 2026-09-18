@@ -1,4 +1,8 @@
 import { chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
+import {
+  chatGptTextIntegrityDiagnosticsEnabled,
+  reportChatGptTextIntegrity,
+} from "./adapters/chatgpt-web/text-integrity";
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { timingSafeEqual } from "node:crypto";
@@ -20,7 +24,7 @@ import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./
 import type { AppConfig } from "./config";
 import { providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
-import { readJsonRequestBody } from "./http-body";
+import { readJsonRequestBodyWithEncoded } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
 import { createHash } from "node:crypto";
 import { augmentNativeModelCatalog } from "./model-catalog";
@@ -360,6 +364,10 @@ export interface ResponseRequestOptions {
   onAdapterEvent?: (event: AdapterEvent) => void;
   /** Bind the physical HTTP stream to the exact native Codex turn that owns it. */
   onTurnIdentity?: (identity: NativeCodexTurnIdentity) => void;
+  /** @internal Transfer an already parsed in-process request without serializing and parsing it again. */
+  preparsedBody?: unknown;
+  /** Keep native forwarding injectable without constructing a browser adapter or local-tool path. */
+  fetchNativeUpstream?: NativeFetch;
 }
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
@@ -470,10 +478,16 @@ export async function responseRequest(
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: ResponseRequestOptions = {},
 ): Promise<Response> {
-  const nativeRequest = req.clone();
   let raw: unknown;
+  let encodedBody: ArrayBuffer | undefined;
   try {
-    raw = await readJsonRequestBody(req);
+    if (options.preparsedBody !== undefined) {
+      raw = options.preparsedBody;
+    } else {
+      const captured = await readJsonRequestBodyWithEncoded(req);
+      raw = captured.value;
+      encodedBody = captured.encodedBody;
+    }
   } catch (error) {
     return formatErrorResponse(
       400,
@@ -494,11 +508,14 @@ export async function responseRequest(
   }
   if (typeof requestedModel === "string" && !isChatGptWebModelSlug(requestedModel)) {
     try {
-      return await forwardNativeCodexRequest(nativeRequest, "responses", undefined, raw);
+      return await forwardNativeCodexRequest(req, "responses", options.fetchNativeUpstream, raw, encodedBody);
     } catch (error) {
       return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
     }
   }
+  // Web routing never needs the original wire representation. Drop the only explicit reference
+  // before prompt compilation and browser execution retain the much larger parsed history.
+  encodedBody = undefined;
   const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
@@ -607,6 +624,19 @@ export async function responseRequest(
       headers: { "content-type": "application/json" },
     });
   }
+  if (traceId && chatGptTextIntegrityDiagnosticsEnabled()) {
+    reportChatGptTextIntegrity(traceId, "responses_input", [{
+      name: "body",
+      text: JSON.stringify(raw),
+    }]);
+    reportChatGptTextIntegrity(traceId, "parsed_messages", [{
+      name: "messages",
+      text: JSON.stringify(parsed.context.messages),
+    }], {
+      messages: parsed.context.messages.length,
+      systemPrompts: parsed.context.systemPrompt?.length ?? 0,
+    });
+  }
   const adapter = adapterFactory(provider);
   const queue = new AsyncEventQueue<AdapterEvent>();
   const abort = new AbortController();
@@ -675,14 +705,16 @@ export async function compactRequest(
   req: Request,
   config: AppConfig,
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
-  options: Pick<ResponseRequestOptions, "onTurnIdentity"> = {},
+  options: Pick<ResponseRequestOptions, "onTurnIdentity" | "fetchNativeUpstream"> = {},
 ): Promise<Response> {
-  const nativeRequest = req.clone();
   let raw: Record<string, unknown>;
+  let encodedBody: ArrayBuffer | undefined;
   try {
-    const parsed = await readJsonRequestBody(req);
+    const captured = await readJsonRequestBodyWithEncoded(req);
+    const parsed = captured.value;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
     raw = parsed as Record<string, unknown>;
+    encodedBody = captured.encodedBody;
   } catch (error) {
     return formatErrorResponse(
       400,
@@ -719,11 +751,14 @@ export async function compactRequest(
   }
   if (!isChatGptWebModelSlug(raw.model)) {
     try {
-      return await forwardNativeCodexRequest(nativeRequest, "responses/compact", undefined, raw);
+      return await forwardNativeCodexRequest(req, "responses/compact", options.fetchNativeUpstream, raw, encodedBody);
     } catch (error) {
       return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
     }
   }
+  // The Web compaction handoff uses the parsed object below; do not retain its encoded duplicate
+  // throughout the browser summarization turn.
+  encodedBody = undefined;
   let route: ChatGptWebModelRoute;
   try {
     route = requireChatGptWebModelRoute(raw.model, config);
@@ -740,13 +775,18 @@ export async function compactRequest(
   const input = Array.isArray(raw.input) ? raw.input : [];
   const headers = new Headers(req.headers);
   headers.set("content-type", "application/json");
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  const internalBody = { ...raw, stream: false, input: [...input, { type: "compaction_trigger" }] };
   const internal = new Request("http://127.0.0.1/v1/responses", {
     method: "POST",
     headers,
-    body: JSON.stringify({ ...raw, stream: false, input: [...input, { type: "compaction_trigger" }] }),
     signal: req.signal,
   });
-  const response = await responseRequest(internal, config, adapterFactory, options);
+  const response = await responseRequest(internal, config, adapterFactory, {
+    ...options,
+    preparsedBody: internalBody,
+  });
   if (!response.ok) return response;
   let body: {
     output?: unknown[];
@@ -1047,7 +1087,7 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity },
+            { onTurnIdentity: bindIdentity, fetchNativeUpstream: dependencies.fetchUpstream },
           ),
           req.signal,
           process.platform,
@@ -1061,7 +1101,7 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity },
+            { onTurnIdentity: bindIdentity, fetchNativeUpstream: dependencies.fetchUpstream },
           ),
           req.signal,
           process.platform,

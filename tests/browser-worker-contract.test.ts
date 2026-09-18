@@ -6,7 +6,7 @@ import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
-import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
@@ -17,6 +17,27 @@ import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGpt
 import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { estimateTokens } from "../src/lib/token-estimate";
 import { chatGptHtmlToMarkdown } from "../src/adapters/chatgpt-web/markdown";
+
+// These older locator fixtures expose waitFor. Adapt their immediate visibility outcome while
+// still exercising the production mutation/deadline loop; the retained-menu suite models DOM events.
+async function contractWaitForConnectorMenu(
+  page: Page,
+  result: { waitFor(options: { state: string; timeout: number; signal?: AbortSignal }): Promise<void> },
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  return ChatGptBrowserWorker.prototype["waitForConnectorMenu"](page, {
+    isVisible: async () => {
+      try {
+        await result.waitFor({ state: "visible", timeout: 1, signal });
+        return true;
+      } catch (error) {
+        if (error instanceof Error && error.name === "TimeoutError") return false;
+        throw error;
+      }
+    },
+  } as never, deadline, signal);
+}
 
 function personalizedTemporaryChatRole(
   _role: string,
@@ -232,9 +253,9 @@ test("response caching rechecks CSS visibility without requiring a DOM mutation"
   }
 });
 
-test("a retained MCP conversation reuses its proven connector binding", () => {
+test("a retained MCP conversation must verify its current connector binding", () => {
   expect(chatGptConnectorAttachmentMode(true, false)).toBe("mention");
-  expect(chatGptConnectorAttachmentMode(true, true)).toBe("retained");
+  expect(chatGptConnectorAttachmentMode(true, true)).toBe("mention");
   expect(chatGptConnectorAttachmentMode(false, false)).toBe("none");
 });
 
@@ -1030,9 +1051,10 @@ test("closing the launcher page is an immediate terminal turn error", async () =
   expect((error as Error).message).toContain("turn was cancelled");
 });
 
-test("active composer resolution waits for exactly one visible editor", async () => {
+test("active composer resolution follows delayed DOM hydration without fixed sleeps", async () => {
   const composer = { id: "active" };
-  const counts = [2, 1];
+  const counts = [0, 2, 1];
+  let mutationWaits = 0;
   const visibleComposers = {
     count: async () => counts.shift() ?? 1,
     first: () => composer,
@@ -1049,7 +1071,14 @@ test("active composer resolution waits for exactly one visible editor", async ()
     activeComposer(page: unknown, timeoutMs?: number): Promise<unknown>;
   }).activeComposer;
 
-  expect(await activeComposer.call({}, page, 500)).toBe(composer);
+  expect(await activeComposer.call({
+    waitForTurnDomMutation: async (observedPage: unknown, timeoutMs: number) => {
+      expect(observedPage).toBe(page);
+      expect(timeoutMs).toBeGreaterThan(0);
+      mutationWaits += 1;
+    },
+  }, page, 500)).toBe(composer);
+  expect(mutationWaits).toBe(2);
 });
 
 test("prompt verification accepts Lexical NBSP preservation without weakening other mismatches", async () => {
@@ -1293,6 +1322,7 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
 
   let activeComposerCalls = 0;
   const resolved = await selectConnector.call({
+    waitForConnectorMenu: contractWaitForConnectorMenu,
     config: { appName: "Codex Native2" },
     connectorIsSelected: async () => connectorSelected,
     selectedConnectorControl: () => selectedConnector,
@@ -1352,6 +1382,7 @@ test("connector selection moves highlight to the exact hidden-viewport row befor
   }).selectConnector;
 
   await expect(selectConnector.call({
+    waitForConnectorMenu: contractWaitForConnectorMenu,
     config: { appName: "Codex Native2 DEV" },
     connectorIsSelected: async () => selected,
     selectedConnectorControl: () => selectedConnector,
@@ -1376,6 +1407,7 @@ test("repeated connector verification reuses its selected pill before clearing t
   }).selectConnector;
 
   await expect(selectConnector.call({
+    waitForConnectorMenu: contractWaitForConnectorMenu,
     config: { appName: "Codex Native2 DEV" },
     activeComposer: async () => selectedComposer,
     connectorIsSelected: async () => true,
@@ -1385,7 +1417,7 @@ test("repeated connector verification reuses its selected pill before clearing t
   expect(checkpoints).toEqual(["personalization-already-enabled", "connector-already-selected"]);
 });
 
-test("connector selection retriggers the complete mention after a fresh-page hydration miss", async () => {
+test("connector selection keeps the same mention while the catalog hydrates", async () => {
   const calls: string[] = [];
   let menuAttempt = 0;
   let selected = false;
@@ -1424,6 +1456,7 @@ test("connector selection retriggers the complete mention after a fresh-page hyd
     },
   };
   const page = {
+    evaluate: async () => {},
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: (selector: string) => selector.includes("__menu-item")
@@ -1436,6 +1469,7 @@ test("connector selection retriggers the complete mention after a fresh-page hyd
 
   let activeComposerCalls = 0;
   await selectConnector.call({
+    waitForConnectorMenu: contractWaitForConnectorMenu,
     config: { appName: "Codex Native2" },
     connectorIsSelected: async () => selected,
     connectorMentionRowTitles: async () => [],
@@ -1449,7 +1483,7 @@ test("connector selection retriggers the complete mention after a fresh-page hyd
   expect(calls).toEqual([
     "clear",
     "clear", "focus", "type", "menu:1",
-    "clear", "focus", "type", "menu:2",
+    "menu:2",
     "activate", "selected",
   ]);
 });
@@ -1525,6 +1559,7 @@ test("connector verification preserves the host-refreshed catalog evidence", asy
   };
   let prepared = 0;
   const fixture = {
+    waitForConnectorMenu: contractWaitForConnectorMenu,
     config: { appName: "Codex Native2", browserDiagnosticsPath: diagnosticsRoot },
     ensurePage: async () => page,
     prepareTemporaryChatSurface: async () => {
@@ -1547,7 +1582,8 @@ test("connector verification preserves the host-refreshed catalog evidence", asy
     );
     expect(prepared).toBe(1);
     expect(calls.filter(call => call === "reload")).toEqual([]);
-    expect(calls.filter(call => call === "menu:stale")).toHaveLength(MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS);
+    expect(calls.filter(call => call === "type")).toHaveLength(1);
+    expect(calls.filter(call => call === "menu:stale").length).toBeGreaterThan(1);
     expect(calls).not.toContain("menu:fresh");
   } finally {
     Date.now = realDateNow;
@@ -1698,6 +1734,7 @@ test("connector catalog refresh stays fail-closed for absent, legacy, and exact 
   const run = async (visibleRows: string[]) => {
     let now = realDateNow();
     const page = {
+      evaluate: async () => {},
       getByRole: personalizedTemporaryChatRole,
       getByText: () => ({ exactConnectorLabel: true }),
       locator: () => ({
@@ -1714,6 +1751,7 @@ test("connector catalog refresh stays fail-closed for absent, legacy, and exact 
     Date.now = () => now;
     try {
       return await selectConnector.call({
+        waitForConnectorMenu: contractWaitForConnectorMenu,
         config: { appName: CHATGPT_CONNECTOR_NAME },
         activeComposer: async () => ({
           fill: async () => {},
@@ -1747,7 +1785,7 @@ test("connector catalog refresh stays fail-closed for absent, legacy, and exact 
     code: "connector_not_found",
     retryable: false,
   });
-  expect(missingMenuError.message).toContain(`after ${MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS}`);
+  expect(missingMenuError.message).toContain("menu absent after 1");
   await expect(run(["Codex Native"])).rejects.toThrow("Legacy ChatGPT connector");
   await expect(run([CHATGPT_CONNECTOR_NAME])).rejects.toThrow("exact row was not visible");
 });
@@ -1832,6 +1870,7 @@ test("tool-capable prompts use the shared Playwright connector selection before 
 
   let activeComposerCalls = 0;
   await attachPrompt.call({
+    waitForConnectorMenu: contractWaitForConnectorMenu,
     config: { appName: "Codex Native2" },
     selectConnector,
     insertPromptText,
@@ -1913,6 +1952,7 @@ test("an aborted connector proof clears its mention before the preflight release
   };
 
   const selection = prototype.selectConnector.call({
+    waitForConnectorMenu: contractWaitForConnectorMenu,
     config: { appName: "Codex Native2" },
     activeComposer: async (_page: unknown, _timeout: number, signal?: AbortSignal) => {
       expect(signal).toBeDefined();
@@ -1960,6 +2000,7 @@ test("a lost connector mention cannot be used as evidence to change personalizat
     selectConnector(page: unknown, capture?: (checkpoint: string) => Promise<void>): Promise<unknown>;
   }).selectConnector;
   await expect(selectConnector.call({
+    waitForConnectorMenu: async () => { throw new ChatGptWebAdapterError("catalog readiness unknown", { status: 424, errorType: "connector_error", code: "connector_not_found", retryable: false }); },
     config: { appName: CHATGPT_CONNECTOR_NAME },
     activeComposer: async () => composer,
     clearChatGptComposerState: async () => { cleanupCalls += 1; },
@@ -2019,6 +2060,7 @@ test("an aborted real connector selection clears the typed mention before return
   };
 
   const selection = prototype.selectConnector.call({
+    waitForConnectorMenu: contractWaitForConnectorMenu,
     config: { appName: "Codex Native2" },
     activeComposer: async () => composer,
     connectorIsSelected: async () => false,
@@ -2112,6 +2154,7 @@ test("an abort after connector activation removes the selected pill before retur
   };
 
   const selection = prototype.selectConnector.call({
+    waitForConnectorMenu: contractWaitForConnectorMenu,
     config: { appName: CHATGPT_CONNECTOR_NAME },
     activeComposer: async () => composer,
     connectorIsSelected: async () => connectorSelected,
@@ -2168,7 +2211,7 @@ test("an abort while inserting a connector prompt clears the selected pill and p
   expect(connectorSelected).toBeFalse();
 });
 
-test("retained tool turns insert into the connector-bound composer without selecting it again", async () => {
+test("retained tool turns verify their connector before inserting the prompt", async () => {
   const attachPrompt = (ChatGptBrowserWorker.prototype as unknown as {
     attachPrompt(
       page: unknown,
@@ -2186,14 +2229,15 @@ test("retained tool turns insert into the connector-bound composer without selec
   const composer = {
     fill: async (value: string) => { expect(value).toBe(""); calls.push("fill"); },
     focus: async () => { calls.push("focus"); },
+    press: async () => { calls.push("end"); },
   };
   await attachPrompt.call({
     activeComposer: async () => composer,
-    selectConnector: async () => { throw new Error("retained connector must not be selected again"); },
-    insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe("retained context"); calls.push("insert"); },
+    selectConnector: async () => { calls.push("verify-connector"); return composer; },
+    insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe(" retained context"); calls.push("insert"); },
     assertPromptAttached: async () => { calls.push("assert"); },
   }, {}, "retained context", true, undefined, undefined, false, undefined, true);
-  expect(calls).toEqual(["fill", "focus", "insert", "assert"]);
+  expect(calls).toEqual(["verify-connector", "focus", "end", "insert", "assert"]);
 });
 
 test("image attachment readiness uses exact file tiles and not localized remove-button text", async () => {
@@ -2389,14 +2433,14 @@ test("Think attachment runs after fresh connector selection and rechecks retaine
     };
     await attach.call(worker, ui.page, "requested task", localTools, undefined, undefined, false, undefined, retained, true);
     expect(submitted).toEqual([true]);
-    expect(connectorSelections).toBe(localTools && !retained ? 1 : 0);
-    if (localTools && !retained) expect(ui.state.connectors).toEqual(["Codex Native2"]);
+    expect(connectorSelections).toBe(localTools ? 1 : 0);
+    if (localTools) expect(ui.state.connectors).toEqual(["Codex Native2"]);
     if (retained) {
       ui.state.pressed = false;
       await attach.call(worker, ui.page, "follow-up task", localTools, undefined, undefined, false, undefined, retained, true);
       expect(submitted).toEqual([true, true]);
       expect(ui.state.commands).toEqual(["/think", "/think"]);
-      expect(connectorSelections).toBe(0);
+      expect(connectorSelections).toBe(2);
     }
   }
 });
@@ -2658,6 +2702,49 @@ test.each([
   const fixture = dialogPage(alertText);
 
   await expect(throwIfChatGptSessionFailureAlert(fixture.page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 401,
+    errorType: "authentication_error",
+    code: "chatgpt_session_expired",
+    retryable: false,
+  });
+});
+
+test.each([
+  "The message you submitted was too long. Please reload the conversation and submit something shorter.",
+  "El mensaje que enviaste era demasiado largo. Vuelve a cargar la conversación y envía algo más corto.",
+  "您提交的消息太长，请重新加载对话并提交较短的内容。",
+  "送信したメッセージが長すぎます。会話を再読み込みして、短いメッセージを送信してください。",
+])("an explicit product message limit is not reported as a generic handoff timeout: %s", async alertText => {
+  const fixture = dialogPage(alertText);
+  await expect(throwIfChatGptSessionFailureAlert(fixture.page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 413,
+    errorType: "invalid_request_error",
+    code: "chatgpt_message_too_long",
+    retryable: false,
+  });
+});
+
+test("an expired session remains authoritative when a message-too-long alert also exists", async () => {
+  const texts = [
+    "The message you submitted was too long. Please submit something shorter.",
+    "Your session has expired. Please log in again to continue using the app.",
+  ];
+  const page = {
+    locator: () => ({
+      filter: ({ hasText }: { hasText: string | RegExp }) => {
+        const visible = texts.some(text => typeof hasText === "string" ? text.includes(hasText) : hasText.test(text));
+        const filtered = {
+          last: () => filtered,
+          isVisible: async () => visible,
+        };
+        return filtered;
+      },
+    }),
+  } as unknown as Page;
+
+  await expect(throwIfChatGptSessionFailureAlert(page)).rejects.toMatchObject({
     name: "ChatGptWebAdapterError",
     status: 401,
     errorType: "authentication_error",
